@@ -67,51 +67,70 @@ class LinkedInBrowser:
         """
         page = self._page
         print(f'  [Browser] Loading /in/{profile_slug}/')
-        page.goto(f'https://www.linkedin.com/in/{profile_slug}/', wait_until='domcontentloaded')
-        page.wait_for_load_state('load')
+        page.goto(f'https://www.linkedin.com/in/{profile_slug}/', wait_until='domcontentloaded', timeout=20000)
         page.wait_for_timeout(3000)
+        # Scroll to top so y-coordinates are consistent
+        page.evaluate('window.scrollTo(0, 0)')
+        page.wait_for_timeout(500)
 
-        # Step 1 — click the Connect <A> element in the profile header (~y 400-560)
-        clicked = page.evaluate('''() => {
+        # Step 1 — get Connect button coords then native-click.
+        # JS el.click() doesn't fire React's event listeners; page.mouse.click() does.
+        coords = page.evaluate('''() => {
             const spans = Array.from(document.querySelectorAll("span"));
-            const connectSpan = spans.find(s => {
-                const t = s.textContent.trim();
+            const s = spans.find(s => {
                 const r = s.getBoundingClientRect();
-                return t === "Connect" && r.y > 380 && r.y < 580 && r.width > 0;
+                return s.textContent.trim() === "Connect" && r.y > 380 && r.y < 600 && r.width > 0;
             });
-            if (!connectSpan) return false;
-            let el = connectSpan;
-            let depth = 0;
-            while (el && el.tagName !== "A" && el.tagName !== "BUTTON" && depth < 6) {
+            if (!s) return null;
+            let el = s;
+            for (let i = 0; i < 6; i++) {
                 el = el.parentElement;
-                depth++;
+                if (!el) break;
+                if (el.tagName === "A" || el.tagName === "BUTTON") {
+                    const r = el.getBoundingClientRect();
+                    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                }
             }
-            if (el) { el.click(); return true; }
-            return false;
+            return null;
         }''')
 
-        if not clicked:
+        if not coords:
             return {'success': False, 'error': 'Connect button not found on profile page'}
 
-        page.wait_for_timeout(1800)
+        print(f'  [Browser] Clicking Connect at ({coords["x"]:.0f}, {coords["y"]:.0f})')
+        page.mouse.click(coords['x'], coords['y'])
 
-        # Step 2 — click "Send without a note" inside #interop-outlet shadow root
-        sent = page.evaluate('''() => {
-            const interop = document.querySelector("#interop-outlet");
-            if (!interop || !interop.shadowRoot) return "no_shadow_root";
-            const btns = Array.from(interop.shadowRoot.querySelectorAll("button"));
-            const sendBtn = btns.find(b => b.textContent.trim() === "Send without a note");
-            if (sendBtn) { sendBtn.click(); return "sent"; }
-            // Return available button labels for debugging
-            return "no_send_btn:" + btns.map(b => b.textContent.trim().substring(0, 30)).join("|");
-        }''')
+        # Wait for shadow modal — poll up to 5s
+        send_coords = None
+        for _ in range(10):
+            page.wait_for_timeout(500)
+            btn_coords = page.evaluate('''() => {
+                const interop = document.querySelector("#interop-outlet");
+                if (!interop || !interop.shadowRoot) return null;
+                const btns = Array.from(interop.shadowRoot.querySelectorAll("button"));
+                const sendBtn = btns.find(b => b.textContent.trim() === "Send without a note");
+                if (!sendBtn) return null;
+                const r = sendBtn.getBoundingClientRect();
+                return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+            }''')
+            if btn_coords:
+                send_coords = btn_coords
+                break
 
-        if sent == 'sent':
-            page.wait_for_timeout(2000)
-            print(f'  [Browser] ✓ Invite sent to {profile_slug}')
-            return {'success': True}
-        else:
-            return {'success': False, 'error': f'Shadow DOM issue: {sent}'}
+        if not send_coords:
+            # Capture what's in shadow for debugging
+            debug = page.evaluate('''() => {
+                const i = document.querySelector("#interop-outlet");
+                if (!i || !i.shadowRoot) return "no shadow";
+                return Array.from(i.shadowRoot.querySelectorAll("button"))
+                    .map(b => b.textContent.trim().substring(0, 30)).join("|");
+            }''')
+            return {'success': False, 'error': f'Send without a note not found. Shadow: {debug}'}
+
+        page.mouse.click(send_coords['x'], send_coords['y'])
+        page.wait_for_timeout(2000)
+        print(f'  [Browser] ✓ Invite sent to {profile_slug}')
+        return {'success': True}
 
     # ------------------------------------------------------------------ #
     #  Invite withdrawal
@@ -200,31 +219,54 @@ class LinkedInBrowser:
         page.wait_for_timeout(2500)
 
         people = page.evaluate('''() => {
-            // Person result cards
-            const cards = Array.from(document.querySelectorAll(
-                ".reusable-search__result-container, [data-chameleon-result-urn], li.reusable-search__result-container"
-            ));
-            return cards.slice(0, 25).map(card => {
-                const link = card.querySelector('a[href*="/in/"]');
-                const href = link ? link.href : "";
-                const slug = href.match(/\\/in\\/([^/?#]+)/)?.[1] || null;
-                // Name — try multiple selectors
-                const nameEl = card.querySelector(
-                    '.entity-result__title-text a span[aria-hidden], .t-16 .visually-hidden + span, .entity-result__title-text span[aria-hidden]'
-                ) || card.querySelector('.entity-result__title-text a');
-                // Title
-                const titleEl = card.querySelector('.entity-result__primary-subtitle, .t-14.t-black.t-normal');
-                // Company
-                const companyEl = card.querySelector('.entity-result__secondary-subtitle, .t-14.t-normal.t-black--light');
+            // LinkedIn dropped semantic class names in 2025 — use structural approach.
+            // Primary result cards are identified by profile links that contain an <img>
+            // (the photo link). Mutual-connection links have no img.
+            const photoLinks = Array.from(document.querySelectorAll('a[href*="/in/"]'))
+                .filter(a => a.querySelector('img'));
 
-                return {
-                    slug: slug,
-                    name: nameEl ? nameEl.textContent.trim() : null,
-                    title: titleEl ? titleEl.textContent.trim() : null,
-                    company: companyEl ? companyEl.textContent.trim() : null,
-                    profile_url: href.split("?")[0] || null
-                };
-            }).filter(p => p.slug && p.name);
+            const results = [];
+            const seen = new Set();
+
+            for (const link of photoLinks) {
+                const slug = (link.href.match(/\\/in\\/([^/?#]+)/) || [])[1];
+                if (!slug || seen.has(slug)) continue;
+                seen.add(slug);
+
+                // Walk up to a card ancestor: find the div that also has a sibling
+                // containing the person's name text (not just the photo)
+                let card = link.parentElement;
+                for (let i = 0; i < 6; i++) {
+                    if (!card) break;
+                    if (card.children.length >= 2) break;
+                    card = card.parentElement;
+                }
+
+                // Extract lines from card innerText (preserves line breaks)
+                const raw = card ? (card.innerText || card.textContent) : link.innerText;
+                const lines = raw.split("\\n")
+                    .map(l => l.trim())
+                    .filter(l => l.length > 1
+                        && !l.match(/^(Connect|Follow|Message|·|•|1st|2nd|3rd|and \\d+ other)$/)
+                        && !l.match(/^\\d+ (mutual|connection)/)
+                    );
+
+                // Name is first meaningful line (strip degree indicator)
+                const name = lines[0]
+                    ? lines[0].replace(/\\s*[•·]\\s*(1st|2nd|3rd).*/, "").trim()
+                    : null;
+                const title = lines[1] || null;
+                const company = lines[2] || null;
+
+                results.push({
+                    slug,
+                    name,
+                    title,
+                    company,
+                    profile_url: "https://www.linkedin.com/in/" + slug + "/"
+                });
+            }
+            return results.slice(0, 25);
         }''')
 
         print(f'  [Browser] Found {len(people)} people')
