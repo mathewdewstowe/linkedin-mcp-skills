@@ -68,7 +68,8 @@ class LinkedInBrowser:
         page = self._page
         print(f'  [Browser] Loading /in/{profile_slug}/')
         page.goto(f'https://www.linkedin.com/in/{profile_slug}/', wait_until='domcontentloaded')
-        page.wait_for_timeout(2500)
+        page.wait_for_load_state('load')
+        page.wait_for_timeout(3000)
 
         # Step 1 — click the Connect <A> element in the profile header (~y 400-560)
         clicked = page.evaluate('''() => {
@@ -126,16 +127,21 @@ class LinkedInBrowser:
         page = self._page
         print(f'  [Browser] Withdrawing invite for {profile_slug}')
         page.goto(f'https://www.linkedin.com/in/{profile_slug}/', wait_until='domcontentloaded')
-        page.wait_for_timeout(2000)
+        page.wait_for_load_state('load')
+        page.wait_for_timeout(3500)
 
-        # Look for "Pending" button or "Withdraw invitation" text
+        # Look for "Pending" button in the profile header (y > 350 filters out nav badges)
         clicked = page.evaluate('''() => {
-            const allSpans = Array.from(document.querySelectorAll("span, button, [role=button]"));
+            const allSpans = Array.from(document.querySelectorAll("span, button, a, [role=button]"));
             const pending = allSpans.find(el => {
                 const t = el.textContent.trim();
-                return (t === "Pending" || t.includes("Withdraw invitation")) && el.getBoundingClientRect().width > 0;
+                const r = el.getBoundingClientRect();
+                return (t === "Pending" || t.includes("Withdraw invitation"))
+                    && r.width > 0
+                    && r.y > 350;
             });
             if (!pending) return false;
+            // Walk up to clickable ancestor (A or BUTTON)
             let el = pending;
             let depth = 0;
             while (el && el.tagName !== "BUTTON" && el.tagName !== "A" && !el.getAttribute("role") && depth < 6) {
@@ -245,21 +251,33 @@ class LinkedInBrowser:
                 const href = profileLink ? profileLink.href : "";
                 const slug = href.match(/\\/in\\/([^/?#]+)/)?.[1] || null;
 
-                // Sent N days ago text
+                // Name — from the profile link's aria-label or visible text span
+                let name = null;
+                if (profileLink) {
+                    name = profileLink.getAttribute("aria-label");
+                    if (!name) {
+                        const nameSpan = profileLink.querySelector("span[aria-hidden='true']") || profileLink.querySelector("span");
+                        name = nameSpan ? nameSpan.textContent.trim() : null;
+                    }
+                }
+                if (!name) {
+                    // Fallback: first bold or heading-like element
+                    const h = li.querySelector("span.t-bold, .t-16, .entity-result__title-text span");
+                    name = h ? h.textContent.trim() : null;
+                }
+
+                // Sent time text
                 const bodyText = li.textContent;
                 const daysMatch = bodyText.match(/Sent (\\d+) days? ago/);
                 const weeksMatch = bodyText.match(/Sent (\\d+) weeks? ago/);
                 const monthsMatch = bodyText.match(/Sent (\\d+) months? ago/);
-                let sentDaysAgo = null;
+                let sentDaysAgo = 0; // default 0 = sent today
                 if (daysMatch) sentDaysAgo = parseInt(daysMatch[1]);
                 else if (weeksMatch) sentDaysAgo = parseInt(weeksMatch[1]) * 7;
                 else if (monthsMatch) sentDaysAgo = parseInt(monthsMatch[1]) * 30;
 
-                // Name — first non-empty leaf text before the title
-                const allText = bodyText.trim().split("\\n").map(s => s.trim()).filter(s => s.length > 2 && s.length < 60);
-
                 return {
-                    name: allText[0] || null,
+                    name: name,
                     slug: slug,
                     profile_url: href.split("?")[0] || null,
                     sent_days_ago: sentDaysAgo
