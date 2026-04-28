@@ -1,0 +1,15 @@
+# Codex internal system skills — not user-owned
+.system/
+codex-primary-runtime/
+
+__pycache__/
+*.py[cod]
+*.pyc
+.DS_Store
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+*.log
+node_modules/

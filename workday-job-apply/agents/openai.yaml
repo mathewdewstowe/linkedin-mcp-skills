@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workday Job Apply"
+  short_description: "Safely apply to Workday jobs"
+  default_prompt: "Apply to this Workday job using the safe reusable workflow."
