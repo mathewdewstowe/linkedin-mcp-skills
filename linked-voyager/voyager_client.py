@@ -119,13 +119,10 @@ class VoyagerClient:
 
         try:
             data = r.json()
-            elements = (
-                data.get('data', {})
-                    .get('identityDashProfilesByMemberIdentity', {})
-                    .get('elements', [])
-            )
-            if elements:
-                return elements[0].get('entityUrn')
+            # URN lives in included[0], not in data.data.elements
+            included = data.get('included', [])
+            if included:
+                return included[0].get('entityUrn')
         except (KeyError, ValueError, IndexError):
             pass
         return None
@@ -145,7 +142,13 @@ class VoyagerClient:
         r = self.session.get(url, params=params)
         if self._check_challenge(r):
             raise RuntimeError('CHALLENGE: LinkedIn requires manual auth. Stop all agents.')
-        return r.json() if r.status_code == 200 else None
+        if r.status_code != 200:
+            return None
+        try:
+            # Counts live in data.data, not data.elements
+            return r.json().get('data', {})
+        except (ValueError, KeyError):
+            return None
 
     # ------------------------------------------------------------------ #
     #  Messaging (ruby-outreach-extension pattern)
@@ -153,7 +156,7 @@ class VoyagerClient:
 
     def send_message(self, recipient_urn: str, message_text: str) -> dict | None:
         """
-        POST /voyagerMessagingDashMessengerMessages?action=createMessage
+        POST /voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage
         Send a direct message to an existing connection.
 
         Args:
@@ -161,7 +164,7 @@ class VoyagerClient:
             message_text:  Plain text message body
         """
         self._throttle()
-        url = 'https://www.linkedin.com/voyagerMessagingDashMessengerMessages?action=createMessage'
+        url = f'{VOYAGER_BASE}/voyagerMessagingDashMessengerMessages?action=createMessage'
         payload = {
             'message': {
                 'body': {
