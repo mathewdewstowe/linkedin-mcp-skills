@@ -1,19 +1,19 @@
 """
-LinkedIn Voyager API Client — Working Endpoints Only
+LinkedIn Voyager API Client — Direct HTTP Endpoints
 
-Most LinkedIn UI actions (invite, withdraw, search) migrated to SDUI in 2024-2025
-and cannot be driven from Python HTTP. Only the endpoints below still work directly.
-
-Working endpoints (confirmed 2026-04-28):
-  GET  /voyager/api/me                          — auth check, current user
-  GET  /voyager/api/graphql                     — profile URN lookup (see get_profile_urn)
-  GET  /voyager/api/relationships/invitationsSummaryV2 — invite counts
-  POST /voyagerMessagingDashMessengerMessages   — send messages (see ruby-outreach-extension)
+Working endpoints (no browser/Playwright needed):
+  GET  /voyager/api/me                                    — auth check
+  GET  /voyager/api/graphql                               — profile URN lookup
+  GET  /voyager/api/relationships/invitationsSummaryV2    — invite counts
+  POST /voyager/api/voyagerMessagingDashMessengerMessages — send message
+  GET  /voyager/api/search/blended (PEOPLE filter)        — people search
+  GET  /voyager/api/search/blended (CONTENT filter)       — post search
+  GET  /voyager/api/reactions/v2                          — post likers
+  GET  /voyager/api/feed/comments                         — post comments
 
 NOT working via direct HTTP (SDUI-only):
   - Send invite           → use browser.py / ConnectorAgent
   - Withdraw invite       → use browser.py / WithdrawerAgent
-  - People search         → use browser.py / PostSearchAgent
   - Invitation list       → use browser.py scraping
 """
 
@@ -182,6 +182,220 @@ class VoyagerClient:
         if self._check_challenge(r):
             raise RuntimeError('CHALLENGE: LinkedIn requires manual auth. Stop all agents.')
         return r.json() if r.status_code in (200, 201) else None
+
+    # ------------------------------------------------------------------ #
+    #  People search
+    # ------------------------------------------------------------------ #
+
+    def search_people(self, query: str, count: int = 20, start: int = 0,
+                      first_degree_only: bool = False) -> list:
+        """
+        GET /search/blended — Search LinkedIn people by keyword.
+        Returns list of dicts: slug, name, headline, urn, profile_url.
+        """
+        self._throttle()
+        filters = 'List((key:resultType,value:List(PEOPLE))'
+        if first_degree_only:
+            filters += ',(key:network,value:List(F))'
+        filters += ')'
+        params = {
+            'q': 'all',
+            'keywords': query,
+            'filters': filters,
+            'count': count,
+            'start': start,
+            'origin': 'GLOBAL_SEARCH_HEADER',
+        }
+        r = self.session.get(f'{VOYAGER_BASE}/search/blended', params=params)
+        if self._check_challenge(r):
+            raise RuntimeError('CHALLENGE: LinkedIn requires manual auth. Stop all agents.')
+        if r.status_code != 200:
+            return []
+
+        people = []
+        try:
+            data = r.json()
+            for item in data.get('included', []):
+                if item.get('$type') != 'com.linkedin.voyager.identity.shared.MiniProfile':
+                    continue
+                slug = item.get('publicIdentifier', '')
+                people.append({
+                    'slug': slug,
+                    'name': f"{item.get('firstName', '')} {item.get('lastName', '')}".strip(),
+                    'headline': item.get('headline', ''),
+                    'urn': item.get('entityUrn', ''),
+                    'profile_url': f'https://www.linkedin.com/in/{slug}/' if slug else '',
+                })
+        except (ValueError, KeyError):
+            pass
+        return people
+
+    # ------------------------------------------------------------------ #
+    #  Post search
+    # ------------------------------------------------------------------ #
+
+    def search_posts(self, query: str, count: int = 20, start: int = 0) -> list:
+        """
+        GET /search/blended — Search LinkedIn posts by keyword.
+        Returns list of dicts: post_urn, post_url, author_slug, author_name, text_snippet.
+        """
+        self._throttle()
+        params = {
+            'q': 'all',
+            'keywords': query,
+            'filters': 'List((key:resultType,value:List(CONTENT)))',
+            'count': count,
+            'start': start,
+            'origin': 'GLOBAL_SEARCH_HEADER',
+        }
+        r = self.session.get(f'{VOYAGER_BASE}/search/blended', params=params)
+        if self._check_challenge(r):
+            raise RuntimeError('CHALLENGE: LinkedIn requires manual auth. Stop all agents.')
+        if r.status_code != 200:
+            return []
+
+        posts = []
+        try:
+            data = r.json()
+            profiles = {
+                item.get('entityUrn', ''): item
+                for item in data.get('included', [])
+                if item.get('$type') == 'com.linkedin.voyager.identity.shared.MiniProfile'
+            }
+            for cluster in data.get('elements', []):
+                for hit in cluster.get('elements', []):
+                    hit_info = hit.get('hitInfo', {})
+                    content = (
+                        hit_info.get('com.linkedin.voyager.search.SearchUpdate')
+                        or hit_info.get('com.linkedin.voyager.search.SearchUpdateV2')
+                    )
+                    if not content:
+                        continue
+                    update_urn = content.get('updateUrn', '')
+                    actor_urn = content.get('actorUrn', '')
+                    summary = content.get('summary', {})
+                    text = summary.get('text', '') if isinstance(summary, dict) else ''
+                    profile = profiles.get(actor_urn, {})
+                    slug = profile.get('publicIdentifier', '')
+                    posts.append({
+                        'post_urn': update_urn,
+                        'post_url': f'https://www.linkedin.com/feed/update/{update_urn}/' if update_urn else '',
+                        'author_slug': slug,
+                        'author_name': f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip(),
+                        'text_snippet': text[:300] if text else '',
+                    })
+        except (ValueError, KeyError):
+            pass
+        return posts
+
+    # ------------------------------------------------------------------ #
+    #  Post likers
+    # ------------------------------------------------------------------ #
+
+    def get_post_likers(self, post_urn: str, count: int = 100, start: int = 0) -> list:
+        """
+        GET /reactions/v2 — Who liked a post.
+        post_urn: e.g. 'urn:li:activity:7321498765432109876'
+        Returns list of dicts: slug, name, headline, urn, profile_url, reaction_type.
+        """
+        self._throttle()
+        params = {
+            'q': 'liked',
+            'entityUrn': post_urn,
+            'count': count,
+            'start': start,
+        }
+        r = self.session.get(f'{VOYAGER_BASE}/reactions/v2', params=params)
+        if self._check_challenge(r):
+            raise RuntimeError('CHALLENGE: LinkedIn requires manual auth. Stop all agents.')
+        if r.status_code != 200:
+            return []
+
+        likers = []
+        try:
+            data = r.json()
+            profiles = {
+                item.get('entityUrn', ''): item
+                for item in data.get('included', [])
+                if item.get('$type') == 'com.linkedin.voyager.identity.shared.MiniProfile'
+            }
+            for element in data.get('elements', []):
+                reactor_urn = element.get('reactorUrn', '')
+                profile = profiles.get(reactor_urn, {})
+                if not profile:
+                    # fuzzy match — reactor_urn sometimes uses a different URN scheme
+                    for urn, p in profiles.items():
+                        if reactor_urn and reactor_urn in urn:
+                            profile = p
+                            break
+                slug = profile.get('publicIdentifier', '')
+                likers.append({
+                    'slug': slug,
+                    'name': f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip(),
+                    'headline': profile.get('headline', ''),
+                    'urn': reactor_urn,
+                    'profile_url': f'https://www.linkedin.com/in/{slug}/' if slug else '',
+                    'reaction_type': element.get('reactionType', 'LIKE'),
+                })
+        except (ValueError, KeyError):
+            pass
+        return likers
+
+    # ------------------------------------------------------------------ #
+    #  Post comments
+    # ------------------------------------------------------------------ #
+
+    def get_post_comments(self, post_urn: str, count: int = 100, start: int = 0) -> list:
+        """
+        GET /feed/comments — Comments on a post with author info.
+        post_urn: e.g. 'urn:li:activity:7321498765432109876'
+        Returns list of dicts: author_slug, author_name, author_headline, comment_text, timestamp, profile_url.
+        """
+        self._throttle()
+        params = {
+            'updateKey': post_urn,
+            'count': count,
+            'start': start,
+        }
+        r = self.session.get(f'{VOYAGER_BASE}/feed/comments', params=params)
+        if self._check_challenge(r):
+            raise RuntimeError('CHALLENGE: LinkedIn requires manual auth. Stop all agents.')
+        if r.status_code != 200:
+            return []
+
+        comments = []
+        try:
+            data = r.json()
+            profiles = {
+                item.get('entityUrn', ''): item
+                for item in data.get('included', [])
+                if item.get('$type') == 'com.linkedin.voyager.identity.shared.MiniProfile'
+            }
+            for element in data.get('elements', []):
+                comment_v2 = element.get('commentV2', {})
+                text = comment_v2.get('text', '') if isinstance(comment_v2, dict) else ''
+                commenter = element.get('commenter', {})
+                member_actor = (
+                    commenter.get('com.linkedin.voyager.feed.MemberActor')
+                    or commenter.get('com.linkedin.voyager.feed.shared.MemberActor')
+                )
+                slug = name = headline = ''
+                if member_actor:
+                    profile = profiles.get(member_actor.get('miniProfile', ''), {})
+                    slug = profile.get('publicIdentifier', '')
+                    name = f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip()
+                    headline = profile.get('headline', '')
+                comments.append({
+                    'author_slug': slug,
+                    'author_name': name,
+                    'author_headline': headline,
+                    'comment_text': text,
+                    'timestamp': element.get('createdTime', 0),
+                    'profile_url': f'https://www.linkedin.com/in/{slug}/' if slug else '',
+                })
+        except (ValueError, KeyError):
+            pass
+        return comments
 
     # ------------------------------------------------------------------ #
     #  Helpers
