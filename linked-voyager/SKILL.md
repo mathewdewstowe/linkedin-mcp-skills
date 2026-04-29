@@ -30,7 +30,10 @@ python /Users/matthew_dewstowe/.codex/skills/linked-voyager/main.py <command>
 ## Architecture
 
 ```
-browser.py            — Playwright automation: send_invite, withdraw, search_people, get_profile_urn
+browser.py            — Playwright automation:
+                        • send_invite, withdraw, search_people (existing)
+                        • search_posts, get_post_likers, get_post_commenters, get_post_comments (new)
+                        • get_profile_urn
 voyager_client.py     — Direct HTTP: /me, profile GraphQL, messaging (still Voyager)
 store.py              — SQLite: invite_queue, invites_sent, daily_counters
 config.py             — ICP queries, title keywords, caps, browser settings
@@ -78,6 +81,100 @@ LinkedIn migrated most UI actions to **SDUI (Server-Driven UI)** in 2024-2025:
 1. Navigate to `/in/{slug}/`
 2. Find "Pending" button in profile header, click it
 3. Find "Withdraw" in shadow root modal or dropdown, click it
+
+---
+
+## Post Engagement Flow (Browser — New Methods)
+
+Four new methods for scraping LinkedIn post engagement data:
+
+### 1. `search_posts(query: str, max_results: int = 20) → list`
+**Search LinkedIn posts by keyword. Returns list of posts with author, title, timestamp.**
+
+```python
+posts = browser.search_posts("product strategy", max_results=5)
+# Returns:
+# [
+#   {
+#     'post_url': 'https://www.linkedin.com/feed/...',
+#     'author_slug': 'janedoe',
+#     'author_name': 'Jane Doe',
+#     'post_title': 'Product strategy insights...',
+#     'timestamp': '2 days ago'
+#   },
+#   ...
+# ]
+```
+
+### 2. `get_post_likers(post_url: str) → list`
+**Extract people who liked a post. Expands likes modal and scrapes profiles.**
+
+```python
+likers = browser.get_post_likers('https://www.linkedin.com/feed/...')
+# Returns:
+# [
+#   {
+#     'slug': 'janedoe',
+#     'name': 'Jane Doe',
+#     'title': 'VP Product',
+#     'company': 'Acme Inc',
+#     'profile_url': 'https://www.linkedin.com/in/janedoe/'
+#   },
+#   ...
+# ]
+```
+
+### 3. `get_post_commenters(post_url: str) → list`
+**Extract people who commented on a post. Loads comment section and scrapes profiles.**
+
+```python
+commenters = browser.get_post_commenters('https://www.linkedin.com/feed/...')
+# Returns:
+# [
+#   {
+#     'slug': 'janedoe',
+#     'name': 'Jane Doe',
+#     'title': 'Director of Product',
+#     'company': 'Acme Inc',
+#     'profile_url': 'https://www.linkedin.com/in/janedoe/',
+#     'timestamp': '1 day ago'
+#   },
+#   ...
+# ]
+```
+
+### 4. `get_post_comments(post_url: str) → list`
+**Extract comment text with author info. Includes comment body, timestamp, reply count.**
+
+```python
+comments = browser.get_post_comments('https://www.linkedin.com/feed/...')
+# Returns:
+# [
+#   {
+#     'author_slug': 'janedoe',
+#     'author_name': 'Jane Doe',
+#     'comment_text': 'Great insights on product roadmap...',
+#     'timestamp': '1 day ago',
+#     'reply_count': 3
+#   },
+#   ...
+# ]
+```
+
+### Usage Example: Find Engaged Prospects
+
+```python
+# Search posts on a topic
+posts = browser.search_posts("AI product strategy")
+
+# Extract commenters (high-intent signal)
+for post in posts[:3]:
+    commenters = browser.get_post_commenters(post['post_url'])
+    # Commenters are warm leads — they engaged with content
+    
+# Export prospects for outreach
+prospects = [c for post in posts for c in browser.get_post_commenters(post['post_url'])]
+```
 
 ---
 

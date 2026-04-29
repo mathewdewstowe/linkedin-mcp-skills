@@ -330,6 +330,300 @@ class LinkedInBrowser:
         return items
 
     # ------------------------------------------------------------------ #
+    #  Post engagement — search, likers, commenters, comments
+    # ------------------------------------------------------------------ #
+
+    def search_posts(self, query: str, max_results: int = 20) -> list:
+        """
+        Search LinkedIn posts by keyword and return list of post objects.
+
+        Returns list of dicts: {post_url, author_slug, author_name, post_title, timestamp}
+        """
+        page = self._page
+        from urllib.parse import quote
+        url = f'https://www.linkedin.com/search/results/content/?keywords={quote(query)}&type=posts'
+
+        print(f'  [Browser] Searching posts: {query}')
+        page.goto(url, wait_until='domcontentloaded')
+        page.wait_for_timeout(2500)
+
+        posts = page.evaluate('''() => {
+            // Post containers are typically role="listitem" or divs with post structure
+            // LinkedIn uses structural matching (no semantic classes after 2025)
+            const listItems = Array.from(document.querySelectorAll('[role="listitem"], [data-test-id*="post"], .feed-shared-update-v2'));
+            const results = [];
+            const seen = new Set();
+
+            for (const item of listItems) {
+                // Extract author link — posts have author profile links
+                const authorLink = item.querySelector('a[href*="/in/"]');
+                if (!authorLink) continue;
+
+                const authorHref = authorLink.href;
+                const authorSlug = (authorHref.match(/\\/in\\/([^/?#]+)/) || [])[1];
+                if (!authorSlug || seen.has(authorSlug)) continue;
+                seen.add(authorSlug);
+
+                // Extract post URL — look for main post link or feed link
+                let postUrl = null;
+                const postLink = item.querySelector('a[href*="/posts/"], a[href*="/feed/"]');
+                if (postLink) {
+                    postUrl = postLink.href.split('?')[0];
+                } else {
+                    // Fallback: construct from feed share ID if present
+                    postUrl = authorHref.split('?')[0]; // Use author profile as fallback
+                }
+
+                // Extract post title (first 50 chars of text content)
+                const textContent = item.innerText || item.textContent;
+                const lines = textContent.split("\\n").filter(l => l.trim().length > 0);
+                // Skip author name and filter UI elements
+                const postTitle = lines.slice(1).join(" ").substring(0, 50).trim();
+
+                // Extract timestamp (look for "X days ago", "X hours ago", etc.)
+                const timeMatch = textContent.match(/(\\d+)\\s*(hours?|days?|weeks?|months?) ago/i);
+                const timestamp = timeMatch ? timeMatch[0] : null;
+
+                // Get author name from aria-label or visible text
+                let authorName = authorLink.getAttribute('aria-label') || '';
+                if (!authorName) {
+                    const nameSpan = authorLink.querySelector('span[aria-hidden="true"]') || authorLink.querySelector('span');
+                    authorName = nameSpan ? nameSpan.textContent.trim() : '';
+                }
+
+                results.push({
+                    post_url: postUrl,
+                    author_slug: authorSlug,
+                    author_name: authorName,
+                    post_title: postTitle || '(no title)',
+                    timestamp: timestamp
+                });
+
+                if (results.length >= 25) break; // Hard limit to prevent memory issues
+            }
+            return results.slice(0, 25);
+        }''')
+
+        print(f'  [Browser] Found {len(posts)} posts')
+        return posts
+
+    def get_post_likers(self, post_url: str) -> list:
+        """
+        Navigate to a post and extract people who liked it.
+
+        Returns list of dicts: {slug, name, title, company, profile_url}
+        """
+        page = self._page
+        print(f'  [Browser] Getting likers for post')
+        page.goto(post_url, wait_until='domcontentloaded')
+        page.wait_for_timeout(3000)
+
+        # Find and click "X likes" button
+        likes_coords = page.evaluate('''() => {
+            const allElements = Array.from(document.querySelectorAll('button, a, span, [role="button"]'));
+            const likesEl = allElements.find(el => {
+                const text = el.textContent.trim();
+                return /^\\d+\\s*likes?$/.test(text);
+            });
+            if (!likesEl) return null;
+            // Walk up to clickable ancestor
+            let el = likesEl;
+            for (let i = 0; i < 6; i++) {
+                if (!el) break;
+                if (el.tagName === 'BUTTON' || el.tagName === 'A' || el.getAttribute('role') === 'button') {
+                    const r = el.getBoundingClientRect();
+                    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+                }
+                el = el.parentElement;
+            }
+            return null;
+        }''')
+
+        if not likes_coords:
+            print(f'  [Browser] ⚠ No likes button found on post')
+            return []
+
+        print(f'  [Browser] Clicking likes at ({likes_coords["x"]:.0f}, {likes_coords["y"]:.0f})')
+        page.mouse.click(likes_coords['x'], likes_coords['y'])
+        page.wait_for_timeout(1500)
+
+        # Extract likers from modal or inline list
+        likers = page.evaluate('''() => {
+            // Check shadow root modal first (like send_invite pattern)
+            let likerElements = [];
+            const interop = document.querySelector("#interop-outlet");
+            if (interop && interop.shadowRoot) {
+                likerElements = Array.from(interop.shadowRoot.querySelectorAll('[role="listitem"], .artdeco-modal__content [role="listitem"]'));
+            }
+            // Fallback to inline list in regular DOM
+            if (likerElements.length === 0) {
+                likerElements = Array.from(document.querySelectorAll('[data-test-id*="like"] [role="listitem"], .modal-content [role="listitem"]'));
+            }
+
+            const results = [];
+            const seen = new Set();
+
+            for (const item of likerElements) {
+                const profileLink = item.querySelector('a[href*="/in/"]');
+                if (!profileLink) continue;
+
+                const slug = (profileLink.href.match(/\\/in\\/([^/?#]+)/) || [])[1];
+                if (!slug || seen.has(slug)) continue;
+                seen.add(slug);
+
+                // Extract name, title, company from text lines
+                const textContent = item.innerText || item.textContent;
+                const lines = textContent.split("\\n")
+                    .map(l => l.trim())
+                    .filter(l => l.length > 1);
+
+                const name = lines[0] || null;
+                const title = lines[1] || null;
+                const company = lines[2] || null;
+
+                results.push({
+                    slug: slug,
+                    name: name,
+                    title: title,
+                    company: company,
+                    profile_url: profileLink.href.split("?")[0]
+                });
+            }
+            return results;
+        }''')
+
+        print(f'  [Browser] ✓ Found {len(likers)} likers')
+        return likers
+
+    def get_post_commenters(self, post_url: str) -> list:
+        """
+        Navigate to a post and extract people who commented on it.
+
+        Returns list of dicts: {slug, name, title, company, profile_url, timestamp}
+        """
+        page = self._page
+        print(f'  [Browser] Getting commenters for post')
+        page.goto(post_url, wait_until='domcontentloaded')
+        page.wait_for_timeout(3000)
+        page.evaluate('window.scrollTo(0, 0)')
+
+        # Scroll down to load comments
+        page.wait_for_timeout(500)
+        page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+        page.wait_for_timeout(2000)
+
+        commenters = page.evaluate('''() => {
+            // Comment containers are role="listitem" under comments section
+            const commentItems = Array.from(document.querySelectorAll('.comments-comments-list [role="listitem"], [data-test-id*="comment"] [role="listitem"]'));
+            const results = [];
+            const seen = new Set();
+
+            for (const item of commentItems) {
+                const profileLink = item.querySelector('a[href*="/in/"]');
+                if (!profileLink) continue;
+
+                const slug = (profileLink.href.match(/\\/in\\/([^/?#]+)/) || [])[1];
+                if (!slug || seen.has(slug)) continue;
+                seen.add(slug);
+
+                // Extract name, title, company
+                const textContent = item.innerText || item.textContent;
+                const lines = textContent.split("\\n")
+                    .map(l => l.trim())
+                    .filter(l => l.length > 1 && !l.match(/^(Reply|Like|More|·|•)$/));
+
+                const name = lines[0] || null;
+                const title = lines[1] || null;
+                const company = lines[2] || null;
+
+                // Extract timestamp
+                const timeMatch = textContent.match(/(\\d+)\\s*(hours?|days?|weeks?|months?) ago/i);
+                const timestamp = timeMatch ? timeMatch[0] : null;
+
+                results.push({
+                    slug: slug,
+                    name: name,
+                    title: title,
+                    company: company,
+                    profile_url: profileLink.href.split("?")[0],
+                    timestamp: timestamp
+                });
+            }
+            return results;
+        }''')
+
+        print(f'  [Browser] ✓ Found {len(commenters)} commenters')
+        return commenters
+
+    def get_post_comments(self, post_url: str) -> list:
+        """
+        Navigate to a post and extract comments with text content.
+
+        Returns list of dicts: {author_slug, author_name, comment_text, timestamp, reply_count}
+        """
+        page = self._page
+        print(f'  [Browser] Getting comments for post')
+        page.goto(post_url, wait_until='domcontentloaded')
+        page.wait_for_timeout(3000)
+
+        # Scroll to load comments
+        page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+        page.wait_for_timeout(2000)
+
+        comments = page.evaluate('''() => {
+            const commentItems = Array.from(document.querySelectorAll('.comments-comments-list [role="listitem"], [data-test-id*="comment"] [role="listitem"]'));
+            const results = [];
+
+            for (const item of commentItems) {
+                const profileLink = item.querySelector('a[href*="/in/"]');
+                if (!profileLink) continue;
+
+                const authorSlug = (profileLink.href.match(/\\/in\\/([^/?#]+)/) || [])[1];
+                if (!authorSlug) continue;
+
+                // Extract author name
+                let authorName = profileLink.getAttribute('aria-label') || '';
+                if (!authorName) {
+                    const nameSpan = profileLink.querySelector('span[aria-hidden="true"]') || profileLink.querySelector('span');
+                    authorName = nameSpan ? nameSpan.textContent.trim() : '';
+                }
+
+                // Extract comment text (skip profile info and metadata)
+                const textContent = item.innerText || item.textContent;
+                const lines = textContent.split("\\n").map(l => l.trim());
+                // Find the actual comment text (skip author name and metadata)
+                let commentText = '';
+                let foundStart = false;
+                for (const line of lines) {
+                    if (foundStart && line.match(/^(Reply|Like|\\d+ replies?)/)) break;
+                    if (foundStart) commentText += line + " ";
+                    if (!foundStart && line === authorName) foundStart = true;
+                }
+                commentText = commentText.trim().substring(0, 300); // Limit to 300 chars
+
+                // Extract timestamp
+                const timeMatch = textContent.match(/(\\d+)\\s*(hours?|days?|weeks?|months?) ago/i);
+                const timestamp = timeMatch ? timeMatch[0] : null;
+
+                // Extract reply count
+                const replyMatch = textContent.match(/(\\d+)\\s*replies?/i);
+                const replyCount = replyMatch ? parseInt(replyMatch[1]) : 0;
+
+                results.push({
+                    author_slug: authorSlug,
+                    author_name: authorName,
+                    comment_text: commentText || '(empty)',
+                    timestamp: timestamp,
+                    reply_count: replyCount
+                });
+            }
+            return results;
+        }''')
+
+        print(f'  [Browser] ✓ Found {len(comments)} comments')
+        return comments
+
+    # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
 
