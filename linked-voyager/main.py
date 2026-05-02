@@ -95,14 +95,31 @@ def main():
             print('\n✅ Cycle complete')
 
     elif command == 'search-people':
-        query = ' '.join(sys.argv[2:]) if len(sys.argv) > 2 else None
-        if not query:
-            print('❌ Usage: search-people <query>')
+        args = sys.argv[2:]
+        first_degree = '--1st' in args
+        title = None
+        positional = []
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a == '--1st':
+                pass
+            elif a.startswith('--title='):
+                title = a.split('=', 1)[1]
+            elif a == '--title' and i + 1 < len(args):
+                title = args[i + 1]
+                i += 1
+            else:
+                positional.append(a)
+            i += 1
+        query = ' '.join(positional)
+        if not query and not title:
+            print('❌ Usage: search-people <query> [--1st] [--title "Job Title"]')
             return
-        first_degree = '--1st' in sys.argv
         client = load_client()
-        people = client.search_people(query, first_degree_only=first_degree)
-        print(f'\nFound {len(people)} people for "{query}":\n')
+        people = client.search_people(query, first_degree_only=first_degree, title=title)
+        label = f'"{query}"' + (f' title="{title}"' if title else '')
+        print(f'\nFound {len(people)} people for {label}:\n')
         for p in people:
             print(f'  {p["name"]}')
             print(f'    {p["headline"]}')
@@ -196,7 +213,9 @@ USAGE:
   python main.py [command] [options]
 
 VOYAGER HTTP (no browser needed — reads JSESSIONID from voyager-campaign.json):
-  search-people <query> [--1st]     Search people (--1st = 1st degree only)
+  search-people <query> [--1st] [--title "Job Title"]
+                                    Search people. --1st = 1st-degree only.
+                                    --title applies the strict current-title facet.
   search-posts  <query>             Search posts by keyword
   post-likers   <url_or_urn>        Who liked a post
   post-comments <url_or_urn>        Comments + commenter names on a post
@@ -212,6 +231,8 @@ BROWSER AUTOMATION (Playwright + Brave):
 EXAMPLES:
   python main.py search-people "VP Sales"
   python main.py search-people "Head of Sales Enablement" --1st
+  python main.py search-people --title "Head of Engineering"
+  python main.py search-people "fintech" --title "VP of Sales" --1st
   python main.py search-posts "AI sales demo"
   python main.py post-likers "https://www.linkedin.com/feed/update/urn:li:activity:123/"
   python main.py post-comments urn:li:activity:7321498765432109876
