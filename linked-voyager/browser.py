@@ -624,6 +624,407 @@ class LinkedInBrowser:
         return comments
 
     # ------------------------------------------------------------------ #
+    #  Voyager API — all routed through Brave browser (li_at auto-included)
+    # ------------------------------------------------------------------ #
+    #
+    #  These methods execute JS fetch() inside the Playwright-controlled
+    #  Brave page.  Because the browser already has an active LinkedIn
+    #  session, li_at is sent automatically — no need to extract it.
+    #
+    #  Encoding note: urllib.parse.quote(safe='') encodes ( → %28 and
+    #  ) → %29 which LinkedIn's Restli variables parser requires.
+    # ------------------------------------------------------------------ #
+
+    def _voyager_fetch(self, url: str) -> dict | None:
+        """Run a Voyager API GET in the browser page and return parsed JSON."""
+        result = self._page.evaluate('''async (url) => {
+            const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
+            const csrf = m ? m[1] : "";
+            try {
+                const r = await fetch(url, {
+                    credentials: "include",
+                    headers: {
+                        "csrf-token": csrf,
+                        "accept": "application/vnd.linkedin.normalized+json+2.1",
+                        "x-restli-protocol-version": "2.0.0",
+                        "x-li-lang": "en_US"
+                    }
+                });
+                return {status: r.status, body: await r.json()};
+            } catch(e) { return {status: 0, error: String(e)}; }
+        }''', url)
+        if not result or result.get('status') != 200:
+            return None
+        return result.get('body')
+
+    def _venc(self, urn: str) -> str:
+        """Encode a URN for Restli variables — encodes : ( ) , =."""
+        return quote(urn, safe='')
+
+    def _voyager_my_urn(self) -> str | None:
+        """Return cached fsd_profile URN, resolving via /me if needed."""
+        if not getattr(self, '_my_urn', None):
+            self.voyager_get_me()
+        return getattr(self, '_my_urn', None)
+
+    # ── Auth ──────────────────────────────────────────────────────────── #
+
+    def voyager_get_me(self) -> dict | None:
+        """
+        GET /voyager/api/me via browser.
+        Caches fsd_profile URN in self._my_urn.
+        Returns MiniProfile dict with firstName, lastName, headline, etc.
+        """
+        d = self._voyager_fetch('https://www.linkedin.com/voyager/api/me')
+        if not d:
+            return None
+        payload = d.get('data', {})
+        mini_urn = payload.get('*miniProfile', '')
+        self._my_urn = (
+            mini_urn.replace('fs_miniProfile:', 'fsd_profile:')
+            if mini_urn else None
+        )
+        included = d.get('included', [])
+        return next(
+            (i for i in included if 'MiniProfile' in i.get('$type', '')),
+            payload,
+        )
+
+    # ── Conversations ─────────────────────────────────────────────────── #
+
+    def voyager_get_conversations(self, count: int = 20) -> list:
+        """
+        GET messengerConversations via browser.
+
+        Returns list of dicts:
+          conversation_urn, participant_name, participant_url,
+          last_message_text, last_message_at, unread_count
+        """
+        mailbox_urn = self._voyager_my_urn()
+        if not mailbox_urn:
+            return []
+
+        url = (
+            'https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql'
+            f'?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48'
+            f'&variables=(mailboxUrn:{self._venc(mailbox_urn)})'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+
+        included = d.get('included', [])
+        participant_map = {
+            i['entityUrn']: i
+            for i in included
+            if i.get('$type') == 'com.linkedin.messenger.MessagingParticipant'
+               and i.get('entityUrn')
+        }
+        message_map = {
+            i['entityUrn']: i
+            for i in included
+            if i.get('$type') == 'com.linkedin.messenger.Message'
+               and i.get('entityUrn')
+        }
+        my_part_urn = f'urn:li:msg_messagingParticipant:{mailbox_urn}'
+
+        conversations = []
+        for conv in included:
+            if conv.get('$type') != 'com.linkedin.messenger.Conversation':
+                continue
+            conv_urn = conv.get('entityUrn', '')
+            unread   = conv.get('unreadCount', 0)
+            last_at  = conv.get('lastActivityAt', 0)
+            title    = (conv.get('title') or {}).get('text', '')
+
+            p_name = p_url = ''
+            for ref in (conv.get('*conversationParticipants') or []):
+                if ref == my_part_urn:
+                    continue
+                p = participant_map.get(ref, {})
+                member = (p.get('participantType') or {}).get('member', {})
+                if not member:
+                    continue
+                first  = (member.get('firstName') or {}).get('text', '')
+                last_n = (member.get('lastName') or {}).get('text', '')
+                raw_url = member.get('profileUrl', '')
+                p_url = raw_url.split('?')[0] if raw_url else ''
+                candidate = f'{first} {last_n}'.strip()
+                if candidate:
+                    p_name = candidate
+                    break
+
+            snippet = ''
+            msg_refs = (conv.get('messages') or {}).get('*elements', [])
+            for mref in reversed(msg_refs):
+                txt = (message_map.get(mref, {}).get('body') or {}).get('text', '')
+                if txt:
+                    snippet = txt[:200]
+                    break
+
+            conversations.append({
+                'conversation_urn':   conv_urn,
+                'participant_name':   p_name or title,
+                'participant_url':    p_url,
+                'last_message_text':  snippet,
+                'last_message_at':    last_at,
+                'unread_count':       unread,
+            })
+        return conversations
+
+    # ── Messages ──────────────────────────────────────────────────────── #
+
+    def voyager_get_messages(self, conversation_urn: str) -> list:
+        """
+        GET messengerMessages via browser.
+        conversation_urn: entityUrn from voyager_get_conversations()
+          e.g. 'urn:li:msg_conversation:(urn:li:fsd_profile:HASH,thread_id)'
+
+        Returns list of dicts (oldest → newest):
+          message_urn, sender_name, sender_url, text, sent_at
+        """
+        url = (
+            'https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql'
+            f'?queryId=messengerMessages.5846eeb71c981f11e0134cb6626cc314'
+            f'&variables=(conversationUrn:{self._venc(conversation_urn)})'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+
+        included = d.get('included', [])
+        participant_map = {
+            i['entityUrn']: i
+            for i in included
+            if i.get('$type') == 'com.linkedin.messenger.MessagingParticipant'
+               and i.get('entityUrn')
+        }
+
+        messages = []
+        for item in included:
+            if item.get('$type') != 'com.linkedin.messenger.Message':
+                continue
+            text    = (item.get('body') or {}).get('text', '') or ''
+            sent_at = item.get('deliveredAt', 0)
+
+            sender_name = sender_url = ''
+            sender_ref = item.get('*sender') or ''
+            if sender_ref:
+                p = participant_map.get(sender_ref, {})
+                member = (p.get('participantType') or {}).get('member', {})
+                first  = (member.get('firstName') or {}).get('text', '')
+                last_n = (member.get('lastName') or {}).get('text', '')
+                sender_name = f'{first} {last_n}'.strip()
+                raw_url = member.get('profileUrl', '')
+                sender_url = raw_url.split('?')[0] if raw_url else ''
+
+            messages.append({
+                'message_urn': item.get('entityUrn', ''),
+                'sender_name': sender_name,
+                'sender_url':  sender_url,
+                'text':        text,
+                'sent_at':     sent_at,
+            })
+
+        messages.sort(key=lambda m: m['sent_at'])
+        return messages
+
+    # ── Post engagement via Voyager API (faster than UI scraping) ──────── #
+
+    def voyager_get_post_likers(self, post_urn: str) -> list:
+        """
+        GET /feed/updates/{urn}?updateType=MAIN_FEED via browser.
+        Extracts Reaction objects from included[].
+
+        post_urn: 'urn:li:activity:XXXXX'
+        Returns list of dicts: slug, name, headline, profile_url, reaction_type.
+        """
+        url = (
+            f'https://www.linkedin.com/voyager/api/feed/updates/{self._venc(post_urn)}'
+            '?updateType=MAIN_FEED'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+
+        likers = []
+        for item in d.get('included', []):
+            if item.get('$type') != 'com.linkedin.voyager.feed.social.Reaction':
+                continue
+            name     = (item.get('name') or {}).get('text', '')
+            headline = (item.get('description') or {}).get('text', '')
+            nav_url  = (item.get('navigationContext') or {}).get('actionTarget', '')
+            profile_url = nav_url.split('?')[0] if nav_url else ''
+            slug = profile_url.rstrip('/').split('/')[-1] if profile_url else ''
+            likers.append({
+                'slug':          slug,
+                'name':          name,
+                'headline':      headline,
+                'urn':           item.get('actorUrn', ''),
+                'profile_url':   profile_url,
+                'reaction_type': item.get('reactionType', 'LIKE'),
+            })
+        return likers
+
+    def voyager_get_post_comments(self, post_urn: str) -> list:
+        """
+        GET /feed/updates/{urn}?updateType=MAIN_FEED via browser.
+        Extracts Comment objects; auto-resolves ugcPost URN if needed.
+
+        post_urn: 'urn:li:activity:XXXXX'
+        Returns list of dicts:
+          author_slug, author_name, author_headline, comment_text, profile_url, timestamp
+        """
+        url = (
+            f'https://www.linkedin.com/voyager/api/feed/updates/{self._venc(post_urn)}'
+            '?updateType=MAIN_FEED'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+
+        included = d.get('included', [])
+
+        # Auto-resolve activity URN → ugcPost URN for full comment list
+        sd = next(
+            (i for i in included if i.get('$type') == 'com.linkedin.voyager.feed.SocialDetail'),
+            None,
+        )
+        if sd:
+            thread_id = sd.get('threadId', '')
+            if thread_id and (thread_id.startswith('ugcPost:') or thread_id.startswith('article:')):
+                ugc_urn = f'urn:li:{thread_id}'
+                if ugc_urn != post_urn:
+                    d2 = self._voyager_fetch(
+                        f'https://www.linkedin.com/voyager/api/feed/updates/{self._venc(ugc_urn)}'
+                        '?updateType=MAIN_FEED'
+                    )
+                    if d2:
+                        included = d2.get('included', [])
+
+        profiles = {}
+        for item in included:
+            if 'MiniProfile' not in item.get('$type', ''):
+                continue
+            hash_id = (item.get('entityUrn') or '').split(':')[-1]
+            if hash_id:
+                profiles[hash_id] = item
+
+        comments = []
+        for item in included:
+            if item.get('$type') != 'com.linkedin.voyager.feed.Comment':
+                continue
+            text     = (item.get('commentV2') or {}).get('text', '') or item.get('comment', '')
+            hash_id  = item.get('commenterProfileId', '')
+            profile  = profiles.get(hash_id, {})
+            slug     = profile.get('publicIdentifier', '')
+            name     = f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip()
+            headline = profile.get('occupation', '') or profile.get('headline', '')
+            comments.append({
+                'author_slug':     slug,
+                'author_name':     name,
+                'author_headline': headline,
+                'comment_text':    text,
+                'timestamp':       item.get('createdTime', 0),
+                'profile_url':     f'https://www.linkedin.com/in/{slug}/' if slug else '',
+            })
+        return comments
+
+    # ── People / post search via feed ─────────────────────────────────── #
+
+    def voyager_search_people(self, query: str = '', title: str | None = None,
+                              first_degree_only: bool = False, count: int = 20) -> list:
+        """
+        Search people via feed/updatesV2 + local keyword filter.
+        (LinkedIn /search/blended is dead — this is the working alternative.)
+
+        Returns list of dicts: slug, name, headline, profile_url.
+        """
+        url = (
+            'https://www.linkedin.com/voyager/api/feed/updatesV2'
+            f'?q=chronFeed&count={min(count * 3, 100)}&updateType=CHRONOLOGICAL'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+
+        people, seen = [], set()
+        for item in d.get('included', []):
+            if item.get('$type') != 'com.linkedin.voyager.identity.shared.MiniProfile':
+                continue
+            slug = item.get('publicIdentifier', '')
+            if not slug or slug in seen:
+                continue
+            name     = f"{item.get('firstName', '')} {item.get('lastName', '')}".strip()
+            headline = item.get('headline', '') or item.get('occupation', '')
+
+            if query and query.lower() not in (name + ' ' + headline).lower():
+                continue
+            if title and title.lower() not in headline.lower():
+                continue
+
+            seen.add(slug)
+            people.append({
+                'slug':        slug,
+                'name':        name,
+                'headline':    headline,
+                'urn':         item.get('entityUrn', ''),
+                'profile_url': f'https://www.linkedin.com/in/{slug}/',
+            })
+            if len(people) >= count:
+                break
+        return people
+
+    def voyager_search_posts(self, query: str, count: int = 20) -> list:
+        """
+        Search posts via feed/updatesV2 + local keyword filter.
+        Returns list of dicts: post_urn, post_url, author_slug, author_name, text_snippet.
+        """
+        url = (
+            'https://www.linkedin.com/voyager/api/feed/updatesV2'
+            f'?q=chronFeed&count={min(count * 3, 100)}&updateType=CHRONOLOGICAL'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+
+        included = d.get('included', [])
+        profiles = {
+            i.get('entityUrn', ''): i
+            for i in included
+            if i.get('$type') == 'com.linkedin.voyager.identity.shared.MiniProfile'
+        }
+
+        posts = []
+        for update in included:
+            if update.get('$type') != 'com.linkedin.voyager.feed.render.UpdateV2':
+                continue
+            activity_urn = (
+                update.get('updateMetadata', {}).get('urn', '')
+                or update.get('entityUrn', '')
+            )
+            if not activity_urn:
+                continue
+            commentary = update.get('commentary', {}) or {}
+            text = (commentary.get('text', {}) or {}).get('text', '')
+            if query and query.lower() not in text.lower():
+                continue
+            actor_ref = update.get('*actor', '')
+            profile   = profiles.get(actor_ref, {})
+            slug      = profile.get('publicIdentifier', '')
+            author    = f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip()
+            posts.append({
+                'post_urn':    activity_urn,
+                'post_url':    f'https://www.linkedin.com/feed/update/{activity_urn}/',
+                'author_slug': slug,
+                'author_name': author,
+                'text_snippet': text[:300],
+            })
+            if len(posts) >= count:
+                break
+        return posts
+
+    # ------------------------------------------------------------------ #
     #  Helpers
     # ------------------------------------------------------------------ #
 

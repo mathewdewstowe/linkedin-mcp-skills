@@ -116,8 +116,10 @@ def main():
         if not query and not title:
             print('❌ Usage: search-people <query> [--1st] [--title "Job Title"]')
             return
-        client = load_client()
-        people = client.search_people(query, first_degree_only=first_degree, title=title)
+        from browser import LinkedInBrowser
+        with LinkedInBrowser() as br:
+            people = br.voyager_search_people(query, title=title,
+                                              first_degree_only=first_degree)
         label = f'"{query}"' + (f' title="{title}"' if title else '')
         print(f'\nFound {len(people)} people for {label}:\n')
         for p in people:
@@ -131,8 +133,9 @@ def main():
         if not query:
             print('❌ Usage: search-posts <query>')
             return
-        client = load_client()
-        posts = client.search_posts(query)
+        from browser import LinkedInBrowser
+        with LinkedInBrowser() as br:
+            posts = br.voyager_search_posts(query)
         print(f'\nFound {len(posts)} posts for "{query}":\n')
         for p in posts:
             print(f'  Author: {p["author_name"]} ({p["author_slug"]})')
@@ -148,8 +151,9 @@ def main():
             print('❌ Usage: post-likers <post_url_or_urn>')
             return
         post_urn = urn_from_url(url_or_urn)
-        client = load_client()
-        likers = client.get_post_likers(post_urn)
+        from browser import LinkedInBrowser
+        with LinkedInBrowser() as br:
+            likers = br.voyager_get_post_likers(post_urn)
         print(f'\n{len(likers)} people liked {post_urn}:\n')
         for p in likers:
             print(f'  {p["name"]}')
@@ -164,8 +168,9 @@ def main():
             print('❌ Usage: post-comments <post_url_or_urn>')
             return
         post_urn = urn_from_url(url_or_urn)
-        client = load_client()
-        comments = client.get_post_comments(post_urn)
+        from browser import LinkedInBrowser
+        with LinkedInBrowser() as br:
+            comments = br.voyager_get_post_comments(post_urn)
         print(f'\n{len(comments)} comments on {post_urn}:\n')
         for c in comments:
             print(f'  {c["author_name"]}')
@@ -174,6 +179,33 @@ def main():
             print(f'    {c["profile_url"]}')
             print(f'    "{c["comment_text"][:200]}"')
             print()
+
+    elif command == 'conversations':
+        from browser import LinkedInBrowser
+        count = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+        with LinkedInBrowser() as br:
+            convs = br.voyager_get_conversations(count=count)
+        print(f'\n{len(convs)} conversations:\n')
+        for c in convs:
+            unread = f'  [{c["unread_count"]} unread]' if c['unread_count'] else ''
+            print(f'  {c["participant_name"]}{unread}')
+            print(f'    {c["participant_url"]}')
+            if c['last_message_text']:
+                print(f'    Last: "{c["last_message_text"][:100]}"')
+            print()
+
+    elif command == 'messages':
+        conversation_urn = sys.argv[2] if len(sys.argv) > 2 else None
+        if not conversation_urn:
+            print('❌ Usage: messages <conversation_urn>')
+            print('  Get conversation URNs with: python main.py conversations')
+            return
+        from browser import LinkedInBrowser
+        with LinkedInBrowser() as br:
+            msgs = br.voyager_get_messages(conversation_urn)
+        print(f'\n{len(msgs)} messages:\n')
+        for m in msgs:
+            print(f'  {m["sender_name"] or "me"}: {m["text"][:120]}')
 
     else:
         print(f'❌ Unknown command: {command}')
@@ -212,15 +244,16 @@ LinkedIn Voyager Skill — v3.0
 USAGE:
   python main.py [command] [options]
 
-VOYAGER HTTP (no browser needed — reads JSESSIONID from voyager-campaign.json):
+VOYAGER API via Brave browser (li_at auto-included — no manual token needed):
   search-people <query> [--1st] [--title "Job Title"]
                                     Search people. --1st = 1st-degree only.
-                                    --title applies the strict current-title facet.
   search-posts  <query>             Search posts by keyword
-  post-likers   <url_or_urn>        Who liked a post
+  post-likers   <url_or_urn>        Who liked a post (Reaction objects)
   post-comments <url_or_urn>        Comments + commenter names on a post
+  conversations [count]             List inbox conversations (default 20)
+  messages      <conversation_urn>  Full message thread history
 
-BROWSER AUTOMATION (Playwright + Brave):
+BROWSER AUTOMATION (Playwright + Brave — UI clicks):
   config                            Show ICP configuration
   status                            Show queue + daily counters
   search [query]                    Search people, queue ICP prospects
@@ -230,17 +263,16 @@ BROWSER AUTOMATION (Playwright + Brave):
 
 EXAMPLES:
   python main.py search-people "VP Sales"
-  python main.py search-people "Head of Sales Enablement" --1st
   python main.py search-people --title "Head of Engineering"
-  python main.py search-people "fintech" --title "VP of Sales" --1st
   python main.py search-posts "AI sales demo"
   python main.py post-likers "https://www.linkedin.com/feed/update/urn:li:activity:123/"
   python main.py post-comments urn:li:activity:7321498765432109876
+  python main.py conversations 10
+  python main.py messages "urn:li:msg_conversation:(...)"
   python main.py connect 5
 
 AUTH:
-  Voyager HTTP  → ~/Job Apply/voyager-campaign.json (sessionToken = JSESSIONID)
-  Browser       → ~/.brave-paginator/profile (must be logged into LinkedIn)
+  All Voyager API + browser → ~/.brave-paginator/profile (logged into LinkedIn)
 
 DATABASE: ~/Job Apply/linked-voyager.db
 ''')
