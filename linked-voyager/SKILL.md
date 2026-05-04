@@ -1,233 +1,185 @@
-# /linked-voyager — LinkedIn Outbound Agent
+---
+name: linkedin
+description: LinkedIn skill — runs through the Voyager API for everything. Search people (with strict job-title filter, OR-list filter, server-side location/geoUrn filter, defaults to UK), search posts, get post likers and comments, list and read inbox conversations, send messages, fetch a person's recent posts and full activity feed, look up companies and find their employees by job title, list pending invites, and browse the homepage feed. All operations go through LinkedIn's internal Voyager API via headless Playwright + a dedicated logged-in Brave profile (~/.brave-paginator/profile). No UI clicks, no Chrome plugin needed at runtime. Trigger phrases include "linkedin", "search linkedin", "find people on linkedin", "find sales directors", "who liked this post", "post likers", "post comments", "linkedin messages", "send linkedin message", "message X on linkedin", "list conversations", "search posts on linkedin", "find employees at X", "company info", "who works at X", "my linkedin feed", "pending invites", "linkedin invites", "what is X posting".
+---
 
-**Skill type:** LinkedIn outbound via Playwright browser automation + Voyager API (Python).
-**Auth:** Dedicated Brave profile at `~/.brave-paginator/profile` (already logged in).
-**Database:** SQLite at `~/Job Apply/linked-voyager.db`
+# LinkedIn Voyager API skill
+
+**Voyager-API-only. No UI clicks, no Chrome plugin at runtime.**
+
+**Skill location:** `__REPO_DIR__/main.py`
+**Auth:** `~/.brave-paginator/profile` — already logged in. Headless Playwright, self-contained.
+
+## How to invoke
+
+Always run via the Bash tool — Matthew does NOT use the terminal manually:
+
+```bash
+cd "__REPO_DIR__"
+python3 main.py <command> [args]
+```
+
+Always wait ~5–8 seconds between consecutive runs (Playwright profile lock).
 
 ---
 
-## Commands
+## ✅ Confirmed working (run these freely)
 
-| Command | Description |
-|---------|-------------|
-| `/linked-voyager status` | Show queue size, pending invites, daily counters |
-| `/linked-voyager search [query]` | Run people search, queue ICP prospects |
-| `/linked-voyager connect` | Send no-note invites from queue (browser automation) |
-| `/linked-voyager withdraw` | Withdraw stale invites >21 days (browser automation) |
-| `/linked-voyager run` | Full orchestrator: search → invite → withdraw |
+### People & profiles
+| Command | What it does |
+|---|---|
+| `search-people [<query>] [--1st] [--title "X"] [--title-any "A,B,C"] [--location "Y"] [--no-location]` | People search. **Default location = UK**. `--title` strict (headline-only) when no free-text query. `--title-any` matches if ANY title appears. `--location` resolves to LinkedIn `geoUrn` for server-side filter. Hardcoded geoUrns: UK, England, Scotland, Wales, NI, London, Manchester, Birmingham, Bristol, Edinburgh, Cardiff, etc. |
+| `profile-posts <slug_or_url> [count]` | Person's recent original posts with reaction/comment counts. |
+| `profile-activity <slug_or_url> [count]` | All recent activity (posts + likes + comments + reposts). |
+
+### Posts & feed
+| Command | What it does |
+|---|---|
+| `search-posts <query>` | Search posts by keyword. |
+| `post-likers <url_or_urn>` | Who liked a post — name, headline, profile URL. |
+| `post-comments <url_or_urn>` | Comments + commenter profiles + comment text. |
+| `my-feed [count]` | My homepage chronological feed. |
+
+### Companies
+| Command | What it does |
+|---|---|
+| `company <slug>` | Company basics: name, tagline, industry, location, description, URN. Uses search-based lookup (legacy `/organization/companies` is dead). |
+| `company-employees <slug> [--title "X"] [--location "Y"] [--1st]` | Employees at a company, filterable by title/location. |
+
+### Conversations (read)
+| Command | What it does |
+|---|---|
+| `conversations [count]` | Inbox conversations (default 20) with participant + last message. |
+| `messages <conversation_urn>` | Full message thread. |
+
+### Messaging (write — Voyager API)
+| Command | What it does |
+|---|---|
+| `send-message <conversation_urn> "<text>"` | Send to existing conversation. |
+| `message-person "<name>" "<text>"` | Search person → send to existing convo OR start new. |
 
 ---
 
-## How to Run
+## ⚠️ Built but need LinkedIn payload-capture to work
 
-Execute via Desktop Commander (no terminal needed):
+These hit endpoints that exist but reject the current payloads (LinkedIn changes formats often). To fix any of these, capture the real request via the Chrome plugin (see "Capturing payloads" below) and update the method.
+
+| Command | Status |
+|---|---|
+| `create-post "<text>" [PUBLIC\|CONNECTIONS]` | Endpoint uses XHR not fetch — needs XHR interceptor capture |
+| `react-post <url_or_urn> [LIKE\|PRAISE\|EMPATHY\|INTEREST\|APPRECIATION\|ENTERTAINMENT]` | Endpoint not yet captured |
+| `comment-post <url_or_urn> "<text>"` | Endpoint not yet captured |
+| `invites-received [count]` | May return 0 — endpoint may need update |
+| `invites-sent [count]` | May return 0 — endpoint may need update |
+| `invite-accept <urn> <shared_secret>` | Untested |
+| `invite-ignore <urn> <shared_secret>` | Untested |
+| `profile-full <slug_or_url>` | Returns basics + recent posts. Full positions/educations need GraphQL profile cards (TODO). |
+| `profile-contact <slug_or_url>` | Endpoint may be deprecated. |
+
+---
+
+## Examples
+
+```bash
+# Search by job title with OR — UK is default
+search-people --title-any "VP Sales,Vice President Sales,CRO,Chief Revenue Officer" --1st
+
+# Strict title in a specific location
+search-people --title "Founder" --location "Cardiff" --1st
+
+# Disable default UK
+search-people --title "VP Sales" --no-location
+
+# Company workflow: find a company, then who works there
+company recall-ai
+company-employees recall-ai --title "Sales"
+
+# Person research
+profile-posts zhu-amanda 10
+profile-activity zhu-amanda 30
+
+# Engagement research
+post-likers "https://www.linkedin.com/feed/update/urn:li:activity:7454908546422558721/"
+post-comments "urn:li:activity:7454908546422558721"
+
+# Messaging
+message-person "Jane Doe" "Hi Jane, hope you're well..."
+conversations 20
+messages "urn:li:msg_conversation:(urn:li:fsd_profile:HASH,thread_id)"
+
+# My own feed
+my-feed 10
 ```
-python /Users/matthew_dewstowe/.codex/skills/linked-voyager/main.py <command>
-```
+
+---
+
+## Voyager API write payloads (for reference / debugging)
+
+### Messaging — `voyagerMessagingDashMessengerMessages?action=createMessage`
+Required (otherwise 400):
+- `trackingId`: 16-byte binary — `String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)))`
+- `dedupeByClientGeneratedToken: false`
+- `accept: application/json` (NOT `application/vnd.linkedin.normalized+json+2.1`)
+
+### Search — `voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0`
+Variables format: `(query:(keywords:URLENCODED,flagshipSearchIntent:SEARCH_SRP,queryParameters:List((key:resultType,value:List(PEOPLE)),(key:network,value:List(F)),(key:geoUrn,value:List(GEO_ID)))))`
+
+Note the wrapper `(query:(...))` — top-level keywords without this wrapper returns a coercion error.
+
+### Profile posts — `/voyager/api/identity/profileUpdatesV2?profileUrn=URN&q=memberShareFeed`
+Posts in `included[]` as `com.linkedin.voyager.feed.render.UpdateV2`. SocialActivityCounts also in `included[]`, lookup by entityUrn.
+
+---
+
+## Capturing payloads (when an endpoint returns 400)
+
+Use the Chrome plugin (`mcp__Claude_in_Chrome__*`) as a debugger:
+1. `select_browser` (Brave) → `tabs_context_mcp` → `navigate` to LinkedIn
+2. Install fetch interceptor:
+   ```js
+   window.__captured = null;
+   const orig = window.fetch;
+   window.fetch = async function(...a) {
+     const url = typeof a[0] === 'string' ? a[0] : a[0].url;
+     if (a[1]?.method === 'POST' && url.includes('TARGET_KEYWORD')) {
+       window.__captured = {url, headers: a[1].headers, body: a[1].body};
+     }
+     return orig.apply(this, a);
+   };
+   ```
+3. Trigger the action via UI → read `window.__captured` → port to `browser.py`
+
+For endpoints that use **XMLHttpRequest** (like `create-post`), patch `XMLHttpRequest.prototype.open` and `.send` instead.
 
 ---
 
 ## Architecture
 
 ```
-browser.py            — Playwright automation:
-                        • send_invite, withdraw, search_people (existing)
-                        • search_posts, get_post_likers, get_post_commenters, get_post_comments (new)
-                        • get_profile_urn
-voyager_client.py     — Direct HTTP: /me, profile GraphQL, messaging (still Voyager)
-store.py              — SQLite: invite_queue, invites_sent, daily_counters
-config.py             — ICP queries, title keywords, caps, browser settings
-agents/
-  post_search.py      — People search via browser → queues profiles
-  connector.py        — Browser automation: navigate + click Connect + shadow DOM
-  withdrawer.py       — Browser automation: navigate + click Withdraw
-orchestrator.py       — Schedules agents, enforces caps + business hours
-main.py               — CLI entry point
+python main.py <command>
+        ↓
+LinkedInBrowser (Playwright, headless, paginator profile)
+        ↓
+page.evaluate(fetch …)   ← Voyager API call from inside the browser
+        ↓
+LinkedIn responds
+        ↓
+parsed JSON → caller
 ```
 
----
-
-## Why Browser Automation (not direct Voyager HTTP)
-
-LinkedIn migrated most UI actions to **SDUI (Server-Driven UI)** in 2024-2025:
-- **Invite send**: Uses SDUI endpoints `/V6iULndpiCPH` + `/uwKVGS9e0oz`
-  - These accept requests only from React's pre-captured native fetch (not overrideable)
-  - Body format uses `proto.sdui.actions.requests.RequestedArguments` (JSON-encoded protobuf)
-  - All direct `window.fetch()` attempts return 400
-- **Search results**: RSC server-rendered (no Voyager search API calls in browser)
-- **Invitation list**: RSC server-rendered (no Voyager list API available)
-- **Invite withdrawal**: SDUI — same issue as send
-
-**What still works via direct HTTP:**
-- `GET /voyager/api/me` — auth check
-- `GET /voyager/api/graphql?variables=(memberIdentity:{slug})&queryId=voyagerIdentityDashProfiles.273a499c117721535e6da078bee17e9c` — profile URN lookup ✅
-- `GET /voyager/api/relationships/invitationsSummaryV2` — invite counts ✅
-- `POST /voyagerMessagingDashMessengerMessages?action=createMessage` — send messages ✅ (see ruby-outreach-extension)
+Auth via cookies on the paginator profile — no manual tokens, no Chrome plugin at runtime.
 
 ---
 
-## Connect Flow (Browser)
+## Database
 
-1. Navigate to `/in/{slug}/`
-2. Find `<span>Connect</span>` at y=400–580, walk up to parent `<A>`, click it
-3. Wait for `#interop-outlet` shadow root modal to render
-4. Find `button[text="Send without a note"]` in shadow root, click it
-5. Wait for SDUI endpoints `/V6iULndpiCPH` + `/uwKVGS9e0oz` to fire (200 = success)
+SQLite at `~/Job Apply/linked-voyager.db` — used by the `connect`/`withdraw`/`run` Playwright-UI campaign commands (these are NOT part of the Voyager-only path; they exist in the same `main.py` for legacy reasons but aren't recommended).
 
 ---
 
-## Withdraw Flow (Browser)
+## When the user asks for something this skill can't do yet
 
-1. Navigate to `/in/{slug}/`
-2. Find "Pending" button in profile header, click it
-3. Find "Withdraw" in shadow root modal or dropdown, click it
-
----
-
-## Post Engagement Flow (Browser — New Methods)
-
-Four new methods for scraping LinkedIn post engagement data:
-
-### 1. `search_posts(query: str, max_results: int = 20) → list`
-**Search LinkedIn posts by keyword. Returns list of posts with author, title, timestamp.**
-
-```python
-posts = browser.search_posts("product strategy", max_results=5)
-# Returns:
-# [
-#   {
-#     'post_url': 'https://www.linkedin.com/feed/...',
-#     'author_slug': 'janedoe',
-#     'author_name': 'Jane Doe',
-#     'post_title': 'Product strategy insights...',
-#     'timestamp': '2 days ago'
-#   },
-#   ...
-# ]
-```
-
-### 2. `get_post_likers(post_url: str) → list`
-**Extract people who liked a post. Expands likes modal and scrapes profiles.**
-
-```python
-likers = browser.get_post_likers('https://www.linkedin.com/feed/...')
-# Returns:
-# [
-#   {
-#     'slug': 'janedoe',
-#     'name': 'Jane Doe',
-#     'title': 'VP Product',
-#     'company': 'Acme Inc',
-#     'profile_url': 'https://www.linkedin.com/in/janedoe/'
-#   },
-#   ...
-# ]
-```
-
-### 3. `get_post_commenters(post_url: str) → list`
-**Extract people who commented on a post. Loads comment section and scrapes profiles.**
-
-```python
-commenters = browser.get_post_commenters('https://www.linkedin.com/feed/...')
-# Returns:
-# [
-#   {
-#     'slug': 'janedoe',
-#     'name': 'Jane Doe',
-#     'title': 'Director of Product',
-#     'company': 'Acme Inc',
-#     'profile_url': 'https://www.linkedin.com/in/janedoe/',
-#     'timestamp': '1 day ago'
-#   },
-#   ...
-# ]
-```
-
-### 4. `get_post_comments(post_url: str) → list`
-**Extract comment text with author info. Includes comment body, timestamp, reply count.**
-
-```python
-comments = browser.get_post_comments('https://www.linkedin.com/feed/...')
-# Returns:
-# [
-#   {
-#     'author_slug': 'janedoe',
-#     'author_name': 'Jane Doe',
-#     'comment_text': 'Great insights on product roadmap...',
-#     'timestamp': '1 day ago',
-#     'reply_count': 3
-#   },
-#   ...
-# ]
-```
-
-### Usage Example: Find Engaged Prospects
-
-```python
-# Search posts on a topic
-posts = browser.search_posts("AI product strategy")
-
-# Extract commenters (high-intent signal)
-for post in posts[:3]:
-    commenters = browser.get_post_commenters(post['post_url'])
-    # Commenters are warm leads — they engaged with content
-    
-# Export prospects for outreach
-prospects = [c for post in posts for c in browser.get_post_commenters(post['post_url'])]
-```
-
----
-
-## SDUI Endpoints (reference, not directly callable from Python)
-
-| Action | URL | Method |
-|--------|-----|--------|
-| Open Connect drawer | `POST /V6iULndpiCPH` | `requestId: com.linkedin.sdui.impl.mynetwork.infra.components.relationshipbuildingdrawer` |
-| Send invite | `POST /uwKVGS9e0oz` | (protobuf JSON body, not directly callable) |
-| Post-send callback | `POST /V6iULndpiCPH` | `requestId: com.linkedin.sdui.requests.mynetwork.handlePostInteropConnection` |
-
----
-
-## Voyager Endpoints (working, callable from Python)
-
-All under `https://www.linkedin.com/voyager/api/`
-
-| Action | Method | Endpoint |
-|--------|--------|----------|
-| Current user | GET | `/me` |
-| Profile URN | GET | `/graphql?variables=(memberIdentity:{slug})&queryId=voyagerIdentityDashProfiles.273a499c117721535e6da078bee17e9c` |
-| Invite counts | GET | `/relationships/invitationsSummaryV2?types=List(SENT_INVITATION_COUNT,PENDING_INVITATION_COUNT)` |
-| Send message | POST | `/voyagerMessagingDashMessengerMessages?action=createMessage` |
-
----
-
-## Throttling
-
-- Between invites: 8–20s random delay
-- Between phases: 5–15 min gap
-- Business hours only: 09:00–17:00 Europe/London
-
----
-
-## Daily Caps
-
-- Invites: 15/day
-- Withdrawals: 20/day
-
----
-
-## ICP Titles (config.py)
-
-VP Sales, Head of Sales Enablement, Sales Enablement Manager, Director of RevOps,
-VP Revenue, CRO, Director of Sales, Head of Solutions Engineering, Product Marketing Manager
-
----
-
-## Status
-
-✅ Working — browser automation confirmed via test session (2026-04-28)
-- Invite send: CONFIRMED via Playwright shadow DOM click
-- Profile URN lookup: CONFIRMED via GraphQL endpoint
-- People search: implemented via browser scraping
-
-⚠️ Accidental test invites sent (2026-04-28): Nevan Burke, Fruzsina Rapavi, Kinnon Brash, Paul Wiltshire, Adrian Stafford
+If the user asks for an action that's in the "needs payload capture" list, offer to:
+1. Run the command anyway (it'll likely 400) and report
+2. Use the Chrome plugin to capture the real format and update the skill in this session
+3. Skip and use a workaround (e.g. for create-post, suggest typing it manually since composing is one click)

@@ -1,201 +1,128 @@
-# LinkedIn Voyager Outbound Agent
+# linked-voyager — LinkedIn Voyager API skill for Claude Code
 
-Multi-agent system for targeted LinkedIn outbound, invocable from Claude chat with `/linked-voyager`.
+A self-contained Claude Code skill that exposes LinkedIn's internal **Voyager API** as CLI commands. Search people, get post likers/comments, send messages, look up companies and their employees — all programmatically, no UI clicks, no Chrome plugin needed at runtime.
 
-## Quick Start
+Auth runs through a dedicated logged-in Brave browser profile.
 
-### 1. Authenticate
+---
 
-Get your LinkedIn session cookies from Chrome DevTools:
+## Setup (5 minutes)
 
-1. Open LinkedIn in Chrome
-2. Open DevTools (F12 → Application tab)
-3. Go to Cookies → linkedin.com
-4. Copy the values of `li_at` and `JSESSIONID`
+### Prerequisites
+- macOS (Linux/Windows untested)
+- Python 3.10+
+- [Brave browser](https://brave.com)
+- A LinkedIn account
+- [Claude Code](https://claude.com/claude-code) installed
 
-Then set environment variables:
+### Install
+
 ```bash
-export LI_AT="<your_li_at_value>"
-export JSESSIONID="<your_jsessionid_value>"
+git clone https://github.com/mathewdewstowe/linkedin-mcp-skills.git
+cd linkedin-mcp-skills/linked-voyager
+chmod +x setup.sh
+./setup.sh
 ```
 
-### 2. Configure Your ICP
+The setup script:
+1. Installs Playwright + Chromium
+2. Creates a dedicated Brave profile at `~/.brave-paginator/profile`
+3. Registers the skill with Claude Code at `~/.claude/skills/linkedin/SKILL.md`
+4. Patches paths so the skill works from your clone location
 
-Edit `config.py`:
+### One-time LinkedIn login
 
-```python
-QUERIES = [
-    'VP Sales OR "Head of Sales"',
-    'RevOps OR "Revenue Operations"',
-    # ... more search queries
-]
-
-SIGNAL_KEYWORDS = [
-    'sales challenge',
-    'deal velocity',
-    'team enablement',
-    # ... keywords that indicate ICP fit
-]
-
-DAILY_INVITE_CAP = 15        # Platform allows ~100/week
-DAILY_COMMENT_CAP = 6        # Warmth + visibility
-WITHDRAW_AFTER_DAYS = 21     # Remove stale invites
+```bash
+"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+  --user-data-dir=$HOME/.brave-paginator/profile
 ```
 
-### 3. Run from Claude Chat
+Log into LinkedIn once in that Brave window. Close it. The session cookie is now saved and the skill can use it indefinitely (until LinkedIn invalidates it — typically months).
 
-```
-/linked-voyager run
-```
+### Verify
 
-## What It Does
-
-### Outbound Flow
-
-```
-Search posts → Find signal keywords → Queue author
-    ↓
-Comment on post (warmth + visibility, 1–2 days before invite)
-    ↓
-Send no-note invite (higher accept rate)
-    ↓
-On accept → Message via free endpoint
-    ↓
-On no-accept after 21 days → Withdraw (keep hygiene)
+```bash
+python3 main.py search-people --title "VP Sales" --1st
 ```
 
-### The Four Agents
+You should see your 1st-degree connections whose headlines contain "VP Sales".
 
-| Agent | Action | Daily Cap | Purpose |
-|-------|--------|-----------|---------|
-| **PostSearchAgent** | Search posts for signal keywords | Unlimited | Find ICP-fit prospects |
-| **CommenterAgent** | Post contextual comments | 5–8/day | Warm account + visibility |
-| **ConnectorAgent** | Send no-note invites | 15/day | Main outreach action |
-| **WithdrawerAgent** | Remove 21+ day pending | 20/day batch | Account hygiene |
+---
 
-## Database
+## Usage
 
-SQLite store at `~/Job Apply/linked-voyager.db` tracks:
+In any Claude Code chat, just ask LinkedIn questions naturally — `/linkedin` triggers automatically:
 
-- **posts** — found via search, matched against signal keywords
-- **invite_queue** — authors ready to invite (FIFO)
-- **invites_sent** — sent invites, status, response
-- **comments_sent** — posted comments for warming
-- **daily_counters** — daily action count (resets at midnight)
+> "Search LinkedIn for sales directors in London, 1st degree only"
+> "Who liked this post: <url>"
+> "Send a LinkedIn message to Jane Doe saying hi"
+> "What's Amanda Zhu been posting?"
+> "Find all VPs at Recall.ai"
 
-## Safety Features
+Claude runs `python3 main.py <command>` under the hood and parses the output.
 
-✅ **Business hours only** — Runs 9am–5pm in account timezone
-✅ **Daily caps enforced** — Hard-stop when limit hit
-✅ **Throttling** — 4–12s reads, 8–20s writes, 5–15min between phases
-✅ **Challenge detection** — Halts on `/checkpoint/` or `/uas/` (manual re-auth needed)
-✅ **Residential IP only** — Datacenter IPs get challenged
-✅ **Dedicated SDR account** — Never run on personal network
+---
 
-## Commands
+## Confirmed-working commands (13)
 
-### `/linked-voyager config`
-Show current ICP (queries, keywords, caps)
+| Command | Description |
+|---|---|
+| `search-people [<query>] [--1st] [--title "X"] [--title-any "A,B,C"] [--location "Y"] [--no-location]` | Search people. Default location = UK. |
+| `search-posts <query>` | Search posts by keyword. |
+| `post-likers <url_or_urn>` | Who liked a post. |
+| `post-comments <url_or_urn>` | Comments + commenter info. |
+| `profile-posts <slug_or_url> [count]` | Person's recent posts. |
+| `profile-activity <slug_or_url> [count]` | All activity (posts + likes + comments + reposts). |
+| `my-feed [count]` | My homepage chronological feed. |
+| `company <slug>` | Company basics. |
+| `company-employees <slug> [--title "X"]` | Employees at a company by title. |
+| `conversations [count]` | Inbox conversations. |
+| `messages <conversation_urn>` | Full message thread. |
+| `send-message <conversation_urn> "<text>"` | Send to existing conversation. |
+| `message-person "<name>" "<text>"` | Search person → send. |
 
-### `/linked-voyager status`
-Check queue size, pending invites, daily counters
+See [`SKILL.md`](./SKILL.md) for the full command reference, examples, and architecture.
 
-### `/linked-voyager search [query]`
-Run post search, find signal authors
-- Optional: provide custom query override
+---
 
-### `/linked-voyager comment`
-Post comments on queued posts (warming, before invites)
-
-### `/linked-voyager connect`
-Send no-note invites from queue (respecting daily cap)
-
-### `/linked-voyager withdraw`
-Withdraw stale pending invites (>21 days)
-
-### `/linked-voyager run [--skip-hours]`
-Run full orchestrator cycle: search → comment → invite → withdraw
-- `--skip-hours`: Bypass business hours check (testing only)
-
-## Architecture
+## How it works
 
 ```
-main.py                    — CLI entry point
-orchestrator.py            — Schedules agents, enforces caps
-voyager_client.py          — Auth, throttled API requests
-store.py                   — SQLite database
-config.py                  — ICP queries, keywords, caps
-agents/
-  post_search.py           — Find signal posts
-  commenter.py             — Warm with comments
-  connector.py             — Send no-note invites
-  withdrawer.py            — Stale invite cleanup
+python3 main.py <command>
+        ↓
+LinkedInBrowser (Playwright, headless, paginator profile)
+        ↓
+page.evaluate(fetch ...)   ← Voyager API call from inside the browser
+        ↓
+LinkedIn responds
+        ↓
+parsed JSON → caller
 ```
 
-## API Integration
+Voyager API endpoints used (via `page.evaluate(fetch(...))`):
+- `voyagerSearchDashClusters` — people / company search
+- `voyagerMessagingGraphQL/graphql` — conversations + messages
+- `voyagerMessagingDashMessengerMessages` — send message
+- `feed/updates/{urn}` — likers + comments
+- `identity/profileUpdatesV2` — profile posts + activity
+- `feed/updatesV2` — homepage feed
 
-### Real Request Shapes Needed
+Cookies (`li_at`, `JSESSIONID`) come from the dedicated Brave profile — no manual token extraction.
 
-The `voyager_client.py` contains template request shapes. These need **real captures from Chrome DevTools** for:
+---
 
-1. **POST search** — `/search/dash/clusters` params/response
-2. **Send invite** — `/growth/normInvitationsList` payload body
-3. **Withdraw invite** — `/relationships/invitations/{id}` payload
-4. **List pending** — `/relationships/sentInvitationViewsV2` response
-5. **Create comment** — `/feed/normComments` payload
-6. **Get me** — `/me` response shape
+## Privacy & safety
 
-**To capture:**
-1. Open LinkedIn, log in
-2. Open DevTools (F12 → Network tab)
-3. Do the action manually (search, send invite, etc.)
-4. Right-click the request → Copy as cURL
-5. Paste into a text file (redact `li_at`, `JSESSIONID`, `bcookie`)
-6. Use the actual request shapes to update payloads in `voyager_client.py`
+- Runs entirely on YOUR machine with YOUR LinkedIn session
+- Never sends cookies anywhere except linkedin.com
+- Never modifies your LinkedIn settings
+- Browser is headless (invisible) — won't disturb your normal Brave usage
+- Uses a SEPARATE Brave profile (`~/.brave-paginator/profile`) so it doesn't interfere with your main browser
 
-## Limitations
+Don't blast 500 invite requests through it — LinkedIn will rate-limit you. Treat it like a tool, not a botnet.
 
-❌ **No automated posting** — Post manually (too risky)
-❌ **No concurrent agents** — Sequential phases with throttling
-❌ **Template API shapes** — Need real captures for 100% accuracy
-❌ **No message auto-reply** — Can message accepted connections manually
+---
 
-## Future Enhancements
+## License
 
-- [ ] Claude API integration for contextual comment generation
-- [ ] Real-time monitoring dashboard
-- [ ] Chrome extension message passing for auth/control
-- [ ] Acceptance rate tracking + adaptive withdraw threshold
-- [ ] Warm-up scheduler for new accounts
-- [ ] A/B test different comment templates
-
-## Account Hygiene Checklist
-
-- [ ] Dedicated SDR account, not personal network
-- [ ] Warmed for 2–3 weeks with manual usage before automation
-- [ ] Residential IP / home machine only
-- [ ] Profile complete, professional photo, decent headline
-- [ ] Content posted manually 2–3x/week
-- [ ] Existing connections (50+) before outbound starts
-- [ ] Monitor daily: check acceptance rate, withdrawals
-
-## Troubleshooting
-
-**Q: "Auth failed" error**
-A: Check `li_at` and `JSESSIONID` cookies. LinkedIn sessions expire; get fresh cookies from DevTools.
-
-**Q: "Account requires manual auth" (challenge)**
-A: LinkedIn detected unusual activity. Log in via browser, solve CAPTCHA, then restart skill.
-
-**Q: Comments not posting / invites not sending**
-A: Real API request shapes needed. See "API Integration" section.
-
-**Q: Daily cap hit too early**
-A: Check time zone in config (ACCOUNT_TIMEZONE). Counters reset at midnight local time.
-
-**Q: Running outside business hours**
-A: Edit BUSINESS_HOURS_START/END in config, or use `/linked-voyager run --skip-hours` for testing.
-
-## Version
-
-v1.0 — MVP with template API shapes, ready for real request integration.
+MIT

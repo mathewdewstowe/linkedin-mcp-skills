@@ -40,10 +40,15 @@ class LinkedInBrowser:
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled']
         )
         pages = self._context.pages
-        self._page = pages[0] if pages else self._context.new_page()
+        if pages:
+            # Reuse the first existing tab — never open a new one
+            self._page = pages[0]
+        else:
+            self._page = self._context.new_page()
         return self
 
     def __exit__(self, *args):
+        # Close only the Playwright connection — leave Brave running with its tabs intact
         try:
             if self._context:
                 self._context.close()
@@ -635,8 +640,16 @@ class LinkedInBrowser:
     #  ) → %29 which LinkedIn's Restli variables parser requires.
     # ------------------------------------------------------------------ #
 
+    def _ensure_linkedin_page(self):
+        """Make sure the current page is on linkedin.com so cookies are accessible."""
+        current = self._page.url or ''
+        if 'linkedin.com' not in current:
+            self._page.goto('https://www.linkedin.com/feed/', wait_until='domcontentloaded', timeout=20000)
+            self._page.wait_for_timeout(1500)
+
     def _voyager_fetch(self, url: str) -> dict | None:
         """Run a Voyager API GET in the browser page and return parsed JSON."""
+        self._ensure_linkedin_page()
         result = self._page.evaluate('''async (url) => {
             const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
             const csrf = m ? m[1] : "";
@@ -829,6 +842,121 @@ class LinkedInBrowser:
         messages.sort(key=lambda m: m['sent_at'])
         return messages
 
+    # ── Send message ──────────────────────────────────────────────────── #
+
+    def voyager_start_conversation(self, recipient_profile_urn: str, text: str) -> bool:
+        """
+        Start a new conversation via Voyager API (createMessage with hostRecipientUrns).
+
+        recipient_profile_urn: fsd_profile URN e.g. 'urn:li:fsd_profile:ACoAAA...'
+        text: first message body
+
+        Returns True on success, False on failure.
+        """
+        mailbox_urn = self._voyager_my_urn()
+        self._ensure_linkedin_page()
+        result = self._page.evaluate('''async ([recipientUrn, bodyText, mailboxUrn]) => {
+            const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
+            const csrf = m ? m[1] : "";
+            const originToken = crypto.randomUUID();
+            const trackingId = String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)));
+            const payload = {
+                message: {
+                    body: { attributes: [], text: bodyText },
+                    renderContentUnions: [],
+                    originToken: originToken
+                },
+                mailboxUrn: mailboxUrn,
+                hostRecipientUrns: [recipientUrn],
+                trackingId: trackingId,
+                dedupeByClientGeneratedToken: false
+            };
+            try {
+                const r = await fetch(
+                    "https://www.linkedin.com/voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage",
+                    {
+                        method: "POST",
+                        credentials: "include",
+                        headers: {
+                            "csrf-token": csrf,
+                            "content-type": "application/json",
+                            "accept": "application/json",
+                            "x-restli-protocol-version": "2.0.0",
+                            "x-li-lang": "en_US"
+                        },
+                        body: JSON.stringify(payload)
+                    }
+                );
+                const txt = await r.text();
+                return {status: r.status, body: txt.slice(0, 400)};
+            } catch(e) { return {status: 0, error: String(e)}; }
+        }''', [recipient_profile_urn, text, mailbox_urn])
+        if not result:
+            return False
+        status = result.get('status', 0)
+        if status not in (200, 201, 204):
+            print(f'  [start_conversation] HTTP {status}: {result.get("body", "")[:200]}')
+            return False
+        return True
+
+    def voyager_send_message(self, conversation_urn: str, text: str,
+                             participant_name: str = '') -> bool:
+        """
+        Send a message via Voyager API (voyagerMessagingDashMessengerMessages?action=createMessage).
+
+        conversation_urn: entityUrn from voyager_get_conversations()
+        text: message body
+        participant_name: unused (kept for backward compat)
+
+        Returns True on success, False on failure.
+        """
+        mailbox_urn = self._voyager_my_urn()
+        self._ensure_linkedin_page()
+        result = self._page.evaluate('''async ([convUrn, bodyText, mailboxUrn]) => {
+            const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
+            const csrf = m ? m[1] : "";
+            const originToken = crypto.randomUUID();
+            // 16-byte binary trackingId — required by LinkedIn
+            const trackingId = String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)));
+            const payload = {
+                message: {
+                    body: { attributes: [], text: bodyText },
+                    renderContentUnions: [],
+                    conversationUrn: convUrn,
+                    originToken: originToken
+                },
+                mailboxUrn: mailboxUrn,
+                trackingId: trackingId,
+                dedupeByClientGeneratedToken: false
+            };
+            try {
+                const r = await fetch(
+                    "https://www.linkedin.com/voyager/api/voyagerMessagingDashMessengerMessages?action=createMessage",
+                    {
+                        method: "POST",
+                        credentials: "include",
+                        headers: {
+                            "csrf-token": csrf,
+                            "content-type": "application/json",
+                            "accept": "application/json",
+                            "x-restli-protocol-version": "2.0.0",
+                            "x-li-lang": "en_US"
+                        },
+                        body: JSON.stringify(payload)
+                    }
+                );
+                const txt = await r.text();
+                return {status: r.status, body: txt.slice(0, 400)};
+            } catch(e) { return {status: 0, error: String(e)}; }
+        }''', [conversation_urn, text, mailbox_urn])
+        if not result:
+            return False
+        status = result.get('status', 0)
+        if status not in (200, 201, 204):
+            print(f'  [send_message] HTTP {status}: {result.get("body", "")[:200]}')
+            return False
+        return True
+
     # ── Post engagement via Voyager API (faster than UI scraping) ──────── #
 
     def voyager_get_post_likers(self, post_urn: str) -> list:
@@ -930,19 +1058,283 @@ class LinkedInBrowser:
             })
         return comments
 
-    # ── People / post search via feed ─────────────────────────────────── #
+    # ── People / post search ──────────────────────────────────────────── #
 
-    def voyager_search_people(self, query: str = '', title: str | None = None,
-                              first_degree_only: bool = False, count: int = 20) -> list:
-        """
-        Search people via feed/updatesV2 + local keyword filter.
-        (LinkedIn /search/blended is dead — this is the working alternative.)
+    # Hardcoded geoUrns for fast/reliable UK + common locations
+    GEO_URN_MAP = {
+        'united kingdom':   '101165590',
+        'uk':               '101165590',
+        'great britain':    '101165590',
+        'england':          '102299470',
+        'scotland':         '100536993',
+        'wales':            '101750022',
+        'northern ireland': '105572676',
+        'london':           '90009496',
+        'greater london':   '90009496',
+        'london area':      '90009496',
+        'manchester':       '102257491',
+        'birmingham':       '105712376',
+        'bristol':          '105778963',
+        'edinburgh':        '105530811',
+        'glasgow':          '102299470',
+        'leeds':            '101165590',  # fallback to UK if uncertain
+        'cardiff':          '101750022',  # Wales
+        'liverpool':        '105712376',
+        'oxford':           '105778963',
+        'cambridge':        '105778963',
+        'bath':             '105778963',
+        # Common non-UK
+        'new york':         '105080838',
+        'san francisco':    '102277331',
+        'paris':            '104246759',
+        'berlin':            '106967730',
+        'dublin':            '104738515',
+    }
 
-        Returns list of dicts: slug, name, headline, profile_url.
+    # ── Profile (full) ────────────────────────────────────────────────── #
+
+    def voyager_get_profile_full(self, slug: str) -> dict | None:
         """
+        Get profile data — uses search + profile activity since legacy
+        /profileView endpoint is deprecated. Returns name, headline, location,
+        recent posts (as a proxy for activity).
+        Note: detailed positions/educations require modern GraphQL profile
+        cards which need queryId capture (TODO).
+        """
+        slug = slug.rstrip('/').split('/')[-1].split('?')[0]
+        # Step 1: search to find the profile + URN
+        people = self.voyager_search_people(slug.replace('-', ' '), count=10)
+        match = next((p for p in people if p.get('slug', '').lower() == slug.lower()),
+                     people[0] if people else None)
+        if not match:
+            return None
+
+        # Step 2: get recent posts for context
+        posts = self.voyager_get_profile_posts(match['urn'].split(',')[0].split('(')[-1] if '(' in match['urn'] else slug, count=5)
+
+        return {
+            'name':       match['name'],
+            'headline':   match['headline'],
+            'location':   match.get('location', ''),
+            'industry':   '',
+            'summary':    '',
+            'public_id':  match['slug'],
+            'profile_url': match['profile_url'],
+            'urn':        match['urn'],
+            'positions':  [],
+            'educations': [],
+            'skills':     [],
+            'recent_posts': posts,
+        }
+
+    def voyager_get_profile_contact(self, slug: str) -> dict | None:
+        """
+        Get contact info via /voyager/api/identity/profiles/{slug}/profileContactInfo.
+        Returns dict with: email, phones[], websites[], twitter, ims, birthday.
+        Only fields the user has chosen to share with you.
+        """
+        slug = slug.rstrip('/').split('/')[-1].split('?')[0]
+        d = self._voyager_fetch(
+            f'https://www.linkedin.com/voyager/api/identity/profiles/{quote(slug, safe="")}/profileContactInfo'
+        )
+        if not d:
+            return None
+        data = d.get('data') or d
+        return {
+            'email':     data.get('emailAddress', ''),
+            'phones':    [p.get('number', '') for p in (data.get('phoneNumbers') or [])],
+            'websites':  [w.get('url', '') for w in (data.get('websites') or [])],
+            'twitter':   [t.get('name', '') for t in (data.get('twitterHandles') or [])],
+            'ims':       [{'provider': im.get('provider', ''), 'id': im.get('id', '')}
+                          for im in (data.get('ims') or [])],
+            'birthday':  data.get('birthDateOn', {}),
+            'address':   data.get('address', ''),
+            'connected_at': data.get('connectedAt', 0),
+        }
+
+    def voyager_get_profile_activity(self, slug_or_urn: str, count: int = 20) -> list:
+        """
+        Get all recent profile activity (posts + likes + comments + reposts).
+        Uses identity/profileUpdatesV2 with q=memberFeed (more inclusive than memberShareFeed).
+        """
+        if slug_or_urn.startswith('urn:li:fsd_profile:'):
+            profile_urn = slug_or_urn
+        else:
+            slug = slug_or_urn.rstrip('/').split('/')[-1].split('?')[0]
+            people = self.voyager_search_people(slug.replace('-', ' '), count=10)
+            match = next((p for p in people if p.get('slug', '').lower() == slug.lower()),
+                         people[0] if people else None)
+            if not match:
+                return []
+            import re as _re
+            m = _re.search(r'(urn:li:fsd_profile:[^,)]+)', match.get('urn', ''))
+            profile_urn = m.group(1) if m else ''
+        if not profile_urn:
+            return []
+
+        # memberFeed includes all activity types
         url = (
-            'https://www.linkedin.com/voyager/api/feed/updatesV2'
-            f'?q=chronFeed&count={min(count * 3, 100)}&updateType=CHRONOLOGICAL'
+            'https://www.linkedin.com/voyager/api/identity/profileUpdatesV2'
+            f'?profileUrn={quote(profile_urn, safe="")}'
+            f'&q=memberFeed&count={count}'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+        included = d.get('included', [])
+        social_counts = {
+            it.get('entityUrn', ''): {
+                'reactions': it.get('numLikes', 0),
+                'comments':  it.get('numComments', 0),
+            }
+            for it in included
+            if it.get('$type') == 'com.linkedin.voyager.feed.shared.SocialActivityCounts'
+        }
+
+        activities = []
+        for it in included:
+            if it.get('$type') != 'com.linkedin.voyager.feed.render.UpdateV2':
+                continue
+            urn = (it.get('updateMetadata') or {}).get('urn', '')
+            commentary = it.get('commentary') or {}
+            text = (commentary.get('text') or {}).get('text', '') or ''
+            actor = (it.get('actor') or {})
+            actor_name = (actor.get('name') or {}).get('text', '')
+            social_ref = it.get('*socialDetail', '')
+            sc = social_counts.get(social_ref, {})
+            if not sc and urn:
+                for c_key, c_val in social_counts.items():
+                    if urn in c_key:
+                        sc = c_val; break
+            # Determine activity type
+            header = it.get('header') or {}
+            header_text = (header.get('text') or {}).get('text', '') if header else ''
+            activities.append({
+                'type':      'repost' if 'reposted' in header_text.lower() else
+                             ('like'  if 'liked'    in header_text.lower() else
+                             ('comment' if 'commented' in header_text.lower() else 'post')),
+                'header':    header_text,
+                'actor':     actor_name,
+                'post_urn':  urn,
+                'post_url':  f'https://www.linkedin.com/feed/update/{urn}/' if urn else '',
+                'text':      text,
+                'reactions': sc.get('reactions', 0),
+                'comments':  sc.get('comments', 0),
+            })
+            if len(activities) >= count:
+                break
+        return activities
+
+    # ── Company ───────────────────────────────────────────────────────── #
+
+    def voyager_get_company(self, slug: str) -> dict | None:
+        """
+        Get company info via search (legacy /organization/companies is deprecated).
+        Returns dict with: name, tagline, industry, urn, company_id, public_url.
+        """
+        slug = slug.rstrip('/').split('/')[-1].split('?')[0]
+        # Use search to find the company
+        keywords = slug.replace('-', ' ').replace('_', ' ')
+        variables = (
+            f'(query:(keywords:{quote(keywords, safe="")},'
+            f'flagshipSearchIntent:SEARCH_SRP,'
+            f'queryParameters:List((key:resultType,value:List(COMPANIES))),'
+            f'includeFiltersInResponse:false))'
+        )
+        url = (
+            'https://www.linkedin.com/voyager/api/graphql'
+            '?queryId=voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0'
+            f'&variables={variables}'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return None
+        # Collect candidates, prefer exact slug match
+        import re as _re
+        candidates = []
+        for item in d.get('included', []):
+            if 'EntityResultViewModel' not in item.get('$type', ''):
+                continue
+            nav_url = (item.get('navigationContext') or {}).get('url', '') or item.get('navigationUrl', '')
+            if '/company/' not in nav_url:
+                continue
+            company_slug = nav_url.split('/company/')[-1].split('?')[0].rstrip('/')
+            candidates.append((item, company_slug, nav_url))
+        # Sort: exact match > startswith > contains
+        slug_l = slug.lower()
+        def rank(c):
+            cs = c[1].lower()
+            if cs == slug_l: return 0
+            if cs.startswith(slug_l): return 1
+            if slug_l in cs: return 2
+            return 3
+        candidates.sort(key=rank)
+        for item, company_slug, nav_url in candidates:
+            if rank((item, company_slug, nav_url)) <= 2:
+                name     = (item.get('title') or {}).get('text', '')
+                tagline  = (item.get('primarySubtitle') or {}).get('text', '')
+                location = (item.get('secondarySubtitle') or {}).get('text', '')
+                summary  = (item.get('summary') or {}).get('text', '') if item.get('summary') else ''
+                urn      = item.get('entityUrn', '')
+                # Extract numeric company id
+                m = _re.search(r'urn:li:fsd_company:(\d+)', urn) or _re.search(r'(\d+)', urn)
+                company_id = m.group(1) if m else ''
+                # Also check trackingUrn for company id
+                track = item.get('trackingUrn', '')
+                m2 = _re.search(r'urn:li:company:(\d+)', track)
+                if m2:
+                    company_id = m2.group(1)
+                return {
+                    'name':       name,
+                    'tagline':    tagline,
+                    'industry':   tagline,  # LinkedIn shows industry in primarySubtitle
+                    'location':   location,
+                    'description':summary,
+                    'urn':        urn,
+                    'company_id': company_id,
+                    'slug':       company_slug,
+                    'public_url': f'https://www.linkedin.com/company/{company_slug}/',
+                    'employee_count': '',  # not available in search hit
+                    'follower_count': '',
+                    'website':    '',
+                    'hq':         {'country': '', 'city': location, 'line1': ''},
+                }
+        # Nothing matched
+        return None
+
+    def voyager_get_company_employees(self, slug: str, title: str | None = None,
+                                      count: int = 20, first_degree_only: bool = False,
+                                      location: str | None = None) -> list:
+        """
+        Get employees at a company, optionally filtered by job title.
+        Uses voyagerSearchDashClusters with currentCompany filter.
+        """
+        # First resolve company slug → company ID
+        company = self.voyager_get_company(slug)
+        if not company:
+            return []
+        company_id = company['company_id']
+
+        kw = title or ''
+        filters = f'List((key:resultType,value:List(PEOPLE)),(key:currentCompany,value:List({company_id}))'
+        if first_degree_only:
+            filters += ',(key:network,value:List(F))'
+        if location:
+            geo_id = self.voyager_geo_lookup(location)
+            if geo_id:
+                filters += f',(key:geoUrn,value:List({geo_id}))'
+        filters += ')'
+
+        variables = (
+            f'(query:(keywords:{quote(kw, safe="")},'
+            f'flagshipSearchIntent:SEARCH_SRP,'
+            f'queryParameters:{filters},'
+            f'includeFiltersInResponse:false))'
+        )
+        url = (
+            'https://www.linkedin.com/voyager/api/graphql'
+            '?queryId=voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0'
+            f'&variables={variables}'
         )
         d = self._voyager_fetch(url)
         if not d:
@@ -950,30 +1342,479 @@ class LinkedInBrowser:
 
         people, seen = [], set()
         for item in d.get('included', []):
-            if item.get('$type') != 'com.linkedin.voyager.identity.shared.MiniProfile':
+            if 'EntityResultViewModel' not in item.get('$type', ''):
                 continue
-            slug = item.get('publicIdentifier', '')
-            if not slug or slug in seen:
-                continue
-            name     = f"{item.get('firstName', '')} {item.get('lastName', '')}".strip()
-            headline = item.get('headline', '') or item.get('occupation', '')
-
-            if query and query.lower() not in (name + ' ' + headline).lower():
+            name     = (item.get('title') or {}).get('text', '')
+            headline = (item.get('primarySubtitle') or {}).get('text', '')
+            loc      = (item.get('secondarySubtitle') or {}).get('text', '')
+            nav_url  = (item.get('navigationContext') or {}).get('url', '') or item.get('navigationUrl', '')
+            ps       = nav_url.split('/in/')[-1].split('?')[0].strip('/') if '/in/' in nav_url else ''
+            urn      = item.get('entityUrn', '')
+            if not name or not ps or ps in seen:
                 continue
             if title and title.lower() not in headline.lower():
                 continue
-
-            seen.add(slug)
+            seen.add(ps)
             people.append({
-                'slug':        slug,
+                'slug':        ps,
                 'name':        name,
                 'headline':    headline,
-                'urn':         item.get('entityUrn', ''),
-                'profile_url': f'https://www.linkedin.com/in/{slug}/',
+                'location':    loc,
+                'urn':         urn,
+                'profile_url': f'https://www.linkedin.com/in/{ps}/',
             })
             if len(people) >= count:
                 break
         return people
+
+    # ── Feed ──────────────────────────────────────────────────────────── #
+
+    def voyager_get_my_feed(self, count: int = 20) -> list:
+        """Get my homepage feed posts. Returns list of dicts with author, text, urn, counts."""
+        url = (
+            'https://www.linkedin.com/voyager/api/feed/updatesV2'
+            f'?q=chronFeed&count={count}'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+        included = d.get('included', [])
+        social_counts = {
+            it.get('entityUrn', ''): {
+                'reactions': it.get('numLikes', 0),
+                'comments':  it.get('numComments', 0),
+            }
+            for it in included
+            if it.get('$type') == 'com.linkedin.voyager.feed.shared.SocialActivityCounts'
+        }
+        posts = []
+        for it in included:
+            if it.get('$type') != 'com.linkedin.voyager.feed.render.UpdateV2':
+                continue
+            urn = (it.get('updateMetadata') or {}).get('urn', '')
+            commentary = it.get('commentary') or {}
+            text = (commentary.get('text') or {}).get('text', '') or ''
+            actor = it.get('actor') or {}
+            actor_name = (actor.get('name') or {}).get('text', '')
+            actor_sub = (actor.get('subDescription') or actor.get('description') or {}).get('text', '')
+            social_ref = it.get('*socialDetail', '')
+            sc = social_counts.get(social_ref, {})
+            if not sc and urn:
+                for c_key, c_val in social_counts.items():
+                    if urn in c_key:
+                        sc = c_val; break
+            posts.append({
+                'author':    actor_name,
+                'sub':       actor_sub,
+                'post_urn':  urn,
+                'post_url':  f'https://www.linkedin.com/feed/update/{urn}/' if urn else '',
+                'text':      text,
+                'reactions': sc.get('reactions', 0),
+                'comments':  sc.get('comments', 0),
+            })
+            if len(posts) >= count:
+                break
+        return posts
+
+    # ── Invites ───────────────────────────────────────────────────────── #
+
+    def voyager_get_invites_received(self, count: int = 50) -> list:
+        """Pending invites received (people asking to connect with me)."""
+        url = (
+            'https://www.linkedin.com/voyager/api/relationships/invitationViews'
+            f'?q=receivedInvitation&start=0&count={count}'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+        invites = []
+        for el in d.get('elements', []):
+            inv = (el.get('invitation') or {})
+            inviter = el.get('genericInvitationView') or {}
+            from_member = (inv.get('fromMember') or inviter.get('inviterMiniProfile') or {})
+            invites.append({
+                'invitation_urn': inv.get('entityUrn', ''),
+                'invitation_id':  inv.get('invitationId', '') or inv.get('entityUrn', '').split(':')[-1],
+                'shared_secret':  inv.get('sharedSecret', ''),
+                'message':        (inv.get('customMessage') or {}).get('text', ''),
+                'from_name':      f"{from_member.get('firstName', '')} {from_member.get('lastName', '')}".strip(),
+                'from_headline':  from_member.get('occupation', '') or from_member.get('headline', ''),
+                'from_slug':      from_member.get('publicIdentifier', ''),
+                'sent_at':        inv.get('sentTime', 0),
+            })
+        return invites
+
+    def voyager_get_invites_sent(self, count: int = 50) -> list:
+        """Pending invites I've sent (still waiting for accept)."""
+        url = (
+            'https://www.linkedin.com/voyager/api/relationships/invitationViews'
+            f'?q=sentInvitation&start=0&count={count}'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+        invites = []
+        for el in d.get('elements', []):
+            inv = (el.get('invitation') or {})
+            recipient = (inv.get('toMember') or {})
+            invites.append({
+                'invitation_urn': inv.get('entityUrn', ''),
+                'invitation_id':  inv.get('invitationId', '') or inv.get('entityUrn', '').split(':')[-1],
+                'shared_secret':  inv.get('sharedSecret', ''),
+                'to_name':        f"{recipient.get('firstName', '')} {recipient.get('lastName', '')}".strip(),
+                'to_headline':    recipient.get('occupation', '') or recipient.get('headline', ''),
+                'to_slug':        recipient.get('publicIdentifier', ''),
+                'sent_at':        inv.get('sentTime', 0),
+            })
+        return invites
+
+    def voyager_invite_action(self, invitation_urn: str, shared_secret: str,
+                              action: str = 'accept') -> bool:
+        """
+        Accept or ignore a received invite.
+        action: 'accept' | 'ignore'
+        """
+        if action not in ('accept', 'ignore'):
+            return False
+        endpoint = 'closeInvitations' if action == 'ignore' else 'acceptInvite'
+        # Use REST endpoint for accept/ignore
+        self._ensure_linkedin_page()
+        result = self._page.evaluate('''async ([url, payload]) => {
+            const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
+            const csrf = m ? m[1] : "";
+            const r = await fetch(url, {
+                method: "POST", credentials: "include",
+                headers: {"csrf-token": csrf, "content-type": "application/json",
+                          "accept": "application/json", "x-restli-protocol-version": "2.0.0"},
+                body: JSON.stringify(payload)
+            });
+            return {status: r.status, body: (await r.text()).slice(0, 200)};
+        }''', [
+            f'https://www.linkedin.com/voyager/api/relationships/invitations?action={endpoint}',
+            {'invitationId': invitation_urn.split(':')[-1], 'sharedSecret': shared_secret,
+             'isGenericInvitation': False}
+        ])
+        return result and result.get('status') in (200, 201, 204)
+
+    # ── Reactions / comments ──────────────────────────────────────────── #
+
+    def voyager_create_post(self, text: str, visibility: str = 'PUBLIC') -> dict | None:
+        """
+        Create a new LinkedIn post.
+        visibility: PUBLIC | CONNECTIONS
+        Returns: {'urn': '...', 'url': '...'} on success, None on failure.
+        """
+        my_urn = self._voyager_my_urn()
+        # Convert fsd_profile URN to person URN if needed
+        person_urn = my_urn.replace('fsd_profile:', 'person:') if my_urn else ''
+        self._ensure_linkedin_page()
+        result = self._page.evaluate('''async ([text, visibility, ownerUrn]) => {
+            const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
+            const csrf = m ? m[1] : "";
+            const trackingId = String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)));
+            const originToken = crypto.randomUUID();
+            const payload = {
+                visibleToConnectionsOnly: visibility === "CONNECTIONS",
+                allowedCommentersScope: "ALL",
+                origin: "FEED",
+                commentary: { text: text, attributes: [] },
+                contentEntities: [],
+                media: null,
+                trackingId: trackingId,
+                originToken: originToken
+            };
+            const url = "https://www.linkedin.com/voyager/api/contentcreation/normShares";
+            const r = await fetch(url, {
+                method: "POST",
+                credentials: "include",
+                headers: {
+                    "csrf-token": csrf,
+                    "content-type": "application/json",
+                    "accept": "application/json",
+                    "x-restli-protocol-version": "2.0.0",
+                    "x-li-lang": "en_US"
+                },
+                body: JSON.stringify(payload)
+            });
+            const txt = await r.text();
+            return {status: r.status, body: txt.slice(0, 500)};
+        }''', [text, visibility, person_urn])
+        if not result:
+            return None
+        if result.get('status') not in (200, 201):
+            print(f'  [create_post] HTTP {result.get("status")}: {result.get("body","")[:300]}')
+            return None
+        # Parse activity URN from response
+        import json as _json, re as _re
+        try:
+            body = _json.loads(result.get('body', '{}'))
+            urn = body.get('updateUrn', '') or body.get('entityUrn', '') or ''
+            if not urn:
+                # Fallback: scan response for activity URN
+                m = _re.search(r'urn:li:activity:\d+', result.get('body', ''))
+                urn = m.group(0) if m else ''
+        except Exception:
+            urn = ''
+        return {
+            'urn': urn,
+            'url': f'https://www.linkedin.com/feed/update/{urn}/' if urn else '',
+        }
+
+    def voyager_react_post(self, post_urn: str, reaction: str = 'LIKE') -> bool:
+        """
+        React to a post.
+        reaction: LIKE | PRAISE | EMPATHY | INTEREST | APPRECIATION | ENTERTAINMENT
+        """
+        # Resolve activity URN if needed
+        if not post_urn.startswith('urn:li:'):
+            import re as _re
+            m = _re.search(r'urn:li:\w+:\d+', post_urn)
+            post_urn = m.group(0) if m else post_urn
+        my_urn = self._voyager_my_urn()
+        self._ensure_linkedin_page()
+        result = self._page.evaluate('''async ([postUrn, reaction, myUrn]) => {
+            const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
+            const csrf = m ? m[1] : "";
+            // Use the dash voyager actions endpoint
+            const url = "https://www.linkedin.com/voyager/api/voyagerSocialDashReactions?threadUrn=" + encodeURIComponent(postUrn);
+            const payload = {reactionType: reaction};
+            const r = await fetch(url, {
+                method: "POST", credentials: "include",
+                headers: {"csrf-token": csrf, "content-type": "application/json",
+                          "accept": "application/json", "x-restli-protocol-version": "2.0.0"},
+                body: JSON.stringify(payload)
+            });
+            return {status: r.status, body: (await r.text()).slice(0, 200)};
+        }''', [post_urn, reaction, my_urn])
+        if not result:
+            return False
+        if result.get('status') not in (200, 201, 204):
+            print(f'  [react_post] HTTP {result.get("status")}: {result.get("body", "")[:200]}')
+            return False
+        return True
+
+    def voyager_comment_post(self, post_urn: str, text: str) -> bool:
+        """Comment on a post."""
+        if not post_urn.startswith('urn:li:'):
+            import re as _re
+            m = _re.search(r'urn:li:\w+:\d+', post_urn)
+            post_urn = m.group(0) if m else post_urn
+        my_urn = self._voyager_my_urn()
+        self._ensure_linkedin_page()
+        result = self._page.evaluate('''async ([postUrn, text, myUrn]) => {
+            const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
+            const csrf = m ? m[1] : "";
+            const url = "https://www.linkedin.com/voyager/api/feed/comments?action=create";
+            const payload = {
+                actor: myUrn,
+                threadUrn: postUrn,
+                commentV2: {text: text, attributes: []}
+            };
+            const r = await fetch(url, {
+                method: "POST", credentials: "include",
+                headers: {"csrf-token": csrf, "content-type": "application/json",
+                          "accept": "application/json", "x-restli-protocol-version": "2.0.0"},
+                body: JSON.stringify(payload)
+            });
+            return {status: r.status, body: (await r.text()).slice(0, 300)};
+        }''', [post_urn, text, my_urn])
+        if not result:
+            return False
+        if result.get('status') not in (200, 201, 204):
+            print(f'  [comment_post] HTTP {result.get("status")}: {result.get("body", "")[:200]}')
+            return False
+        return True
+
+    def voyager_geo_lookup(self, location: str) -> str | None:
+        """Resolve a location string to a LinkedIn geoUrn id.
+        Uses hardcoded map first, then typeahead as fallback."""
+        key = location.lower().strip()
+        if key in self.GEO_URN_MAP:
+            return self.GEO_URN_MAP[key]
+        # Typeahead fallback (queryId may rotate — best-effort)
+        url = (
+            'https://www.linkedin.com/voyager/api/graphql'
+            '?queryId=voyagerSearchDashReusableTypeahead.b8f1adee2f8def6d50d4d54b2b8b4a76'
+            f'&variables=(query:(typeaheadFilterQuery:(geoSearchTypes:List(MARKET_AREA,COUNTRY_REGION,ADMIN_DIVISION_1,CITY)),'
+            f'typeaheadUseCase:GEO,keywords:{quote(location, safe="")}))'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return None
+        import json as _json, re as _re
+        m = _re.search(r'urn:li:geo:(\d+)', _json.dumps(d))
+        return m.group(1) if m else None
+
+    def voyager_search_people(self, query: str = '', title: str | None = None,
+                              first_degree_only: bool = False, count: int = 20,
+                              location: str | None = None,
+                              title_strict: bool = False,
+                              titles_any: list | None = None) -> list:
+        """
+        Search people via Voyager GraphQL search.
+
+        Args:
+          query: keywords for full-text search
+          title: job title — when title_strict=True, ONLY headline is matched
+          first_degree_only: filter to 1st-degree connections
+          location: optional location filter (matched against secondarySubtitle)
+          title_strict: if True, require `title` substring to appear in headline
+
+        Returns list of dicts: slug, name, headline, location, profile_url, urn.
+        """
+        # Build keyword: free-text query, or first title in list, or single title
+        kw = query
+        if not kw:
+            if titles_any:
+                kw = ' OR '.join(f'"{t}"' for t in titles_any)
+            elif title:
+                kw = title
+        # Resolve location → geoUrn for server-side filtering
+        geo_id = None
+        if location:
+            geo_id = self.voyager_geo_lookup(location)
+            if geo_id:
+                print(f'  [search] Resolved "{location}" → geoUrn {geo_id}')
+            else:
+                print(f'  [search] Could not resolve location "{location}" — falling back to client-side filter')
+        filters = 'List((key:resultType,value:List(PEOPLE))'
+        if first_degree_only:
+            filters += ',(key:network,value:List(F))'
+        if geo_id:
+            filters += f',(key:geoUrn,value:List({geo_id}))'
+        filters += ')'
+        variables = (
+            f'(query:(keywords:{quote(kw, safe="")},'
+            f'flagshipSearchIntent:SEARCH_SRP,'
+            f'queryParameters:{filters},'
+            f'includeFiltersInResponse:false))'
+        )
+        url = (
+            'https://www.linkedin.com/voyager/api/graphql'
+            '?queryId=voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0'
+            f'&variables={variables}'
+        )
+        d = self._voyager_fetch(url)
+        people, seen = [], set()
+
+        if d:
+            for item in d.get('included', []):
+                t = item.get('$type', '')
+                if 'EntityResultViewModel' not in t:
+                    continue
+                name     = (item.get('title') or {}).get('text', '')
+                headline = (item.get('primarySubtitle') or {}).get('text', '')
+                loc      = (item.get('secondarySubtitle') or {}).get('text', '')
+                nav_url  = (item.get('navigationContext') or {}).get('url', '') or item.get('navigationUrl', '')
+                slug     = nav_url.split('/in/')[-1].split('?')[0].strip('/') if '/in/' in nav_url else ''
+                urn      = item.get('entityUrn', '')
+                if not name or not slug or slug in seen:
+                    continue
+
+                # OR list of titles — match if ANY appears in headline
+                if titles_any:
+                    if not any(t.lower() in headline.lower() for t in titles_any):
+                        continue
+                # Single strict title filter — must appear in headline
+                elif title and title_strict:
+                    if title.lower() not in headline.lower():
+                        continue
+                elif title and not title_strict:
+                    if title.lower() not in (headline + ' ' + name).lower():
+                        continue
+
+                # Client-side location filter only if geoUrn lookup failed
+                if location and not geo_id:
+                    if location.lower() not in loc.lower():
+                        continue
+
+                seen.add(slug)
+                people.append({
+                    'slug':        slug,
+                    'name':        name,
+                    'headline':    headline,
+                    'location':    loc,
+                    'urn':         urn,
+                    'profile_url': f'https://www.linkedin.com/in/{slug}/',
+                })
+                if len(people) >= count:
+                    break
+        return people
+
+    def voyager_get_profile_posts(self, slug_or_urn: str, count: int = 10) -> list:
+        """
+        Get a member's recent posts via identity/profileUpdatesV2 (memberShareFeed).
+
+        slug_or_urn: search-result fsd_profile URN OR a public identifier like 'zhu-amanda'.
+        Returns list of dicts: post_urn, post_url, text, reactions, comments, share_url.
+        """
+        # Resolve slug → fsd_profile URN
+        if slug_or_urn.startswith('urn:li:fsd_profile:'):
+            profile_urn = slug_or_urn
+        else:
+            slug = slug_or_urn.rstrip('/').split('/')[-1].split('?')[0]
+            people = self.voyager_search_people(slug.replace('-', ' '), count=10)
+            match = next((p for p in people if p.get('slug', '').lower() == slug.lower()), None) \
+                    or (people[0] if people else None)
+            if not match:
+                return []
+            import re as _re
+            m = _re.search(r'(urn:li:fsd_profile:[^,)]+)', match.get('urn', ''))
+            profile_urn = m.group(1) if m else ''
+        if not profile_urn:
+            return []
+
+        url = (
+            'https://www.linkedin.com/voyager/api/identity/profileUpdatesV2'
+            f'?profileUrn={quote(profile_urn, safe="")}'
+            f'&q=memberShareFeed&count={count}'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+
+        included = d.get('included', [])
+        # Build lookup: socialDetail URN -> counts
+        social_counts = {}
+        for it in included:
+            if it.get('$type') == 'com.linkedin.voyager.feed.shared.SocialActivityCounts':
+                key = it.get('entityUrn', '')
+                social_counts[key] = {
+                    'reactions': it.get('numLikes', 0) or it.get('numImpressions', 0),
+                    'comments':  it.get('numComments', 0),
+                }
+
+        # Now scan UpdateV2 items
+        posts = []
+        for it in included:
+            if it.get('$type') != 'com.linkedin.voyager.feed.render.UpdateV2':
+                continue
+            meta = it.get('updateMetadata') or {}
+            urn = meta.get('urn', '')
+            share_url = (it.get('socialContent') or {}).get('shareUrl', '')
+            commentary = it.get('commentary') or {}
+            text = (commentary.get('text') or {}).get('text', '') or ''
+
+            # Counts via socialDetail ref
+            social_ref = it.get('*socialDetail', '')
+            sc = social_counts.get(social_ref, {})
+            # Fallback: scan included for SocialActivityCounts whose entityUrn contains this activity
+            if not sc and urn:
+                for c_key, c_val in social_counts.items():
+                    if urn in c_key:
+                        sc = c_val; break
+
+            posts.append({
+                'post_urn':   urn,
+                'post_url':   f'https://www.linkedin.com/feed/update/{urn}/' if urn else '',
+                'share_url':  share_url,
+                'text':       text,
+                'reactions':  sc.get('reactions', 0),
+                'comments':   sc.get('comments', 0),
+            })
+            if len(posts) >= count:
+                break
+        return posts
 
     def voyager_search_posts(self, query: str, count: int = 20) -> list:
         """
