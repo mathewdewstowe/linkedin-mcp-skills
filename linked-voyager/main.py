@@ -347,6 +347,51 @@ def main():
         print(f'  LinkedIn:   {c["public_url"]}')
         if c['description']: print(f'\n  {c["description"][:400]}...')
 
+    elif command == 'profile-current-company':
+        url = sys.argv[2] if len(sys.argv) > 2 else None
+        if not url: print('❌ Usage: profile-current-company <linkedin_url>'); return
+        from browser import LinkedInBrowser
+        with LinkedInBrowser(headless=True) as br:
+            r = br.voyager_get_profile_current_company(url)
+        if not r or not r.get('company_name'):
+            print('❌ Could not resolve current company'); return
+        print(f'\n{r["company_name"]}')
+        if r.get('job_title'):     print(f'  Job title:     {r["job_title"]}')
+        if r.get('industry'):      print(f'  Industry:      {r["industry"]}')
+        if r.get('employee_count'):print(f'  Employees:     {r["employee_count"]}')
+        if r.get('company_slug'):  print(f'  Slug:          {r["company_slug"]}')
+        if r.get('company_id'):    print(f'  Company ID:    {r["company_id"]}')
+
+    elif command == 'company-size':
+        slug = sys.argv[2] if len(sys.argv) > 2 else None
+        if not slug: print('❌ Usage: company-size <slug>'); return
+        from browser import LinkedInBrowser
+        with LinkedInBrowser(headless=True) as br:
+            r = br.voyager_get_company_size(slug)
+        if not r: print('❌ Not found'); return
+        print(f'\n{r}')
+
+    elif command == 'company-jobs':
+        slug_or_id = sys.argv[2] if len(sys.argv) > 2 else None
+        keywords = sys.argv[3] if len(sys.argv) > 3 else ''
+        count = int(sys.argv[4]) if len(sys.argv) > 4 else 50
+        if not slug_or_id: print('❌ Usage: company-jobs <slug_or_id> [keywords] [count]'); return
+        from browser import LinkedInBrowser
+        with LinkedInBrowser(headless=True) as br:
+            # Resolve slug → id if needed
+            company_id = slug_or_id
+            if not slug_or_id.isdigit():
+                c = br.voyager_get_company(slug_or_id)
+                if not c: print(f'❌ Company "{slug_or_id}" not found'); return
+                company_id = c.get('company_id', slug_or_id)
+            jobs = br.voyager_search_company_jobs(company_id, keywords=keywords, count=count)
+        print(f'\n{len(jobs)} jobs:\n')
+        for j in jobs:
+            print(f'  {j.get("title","?")}')
+            if j.get('location'): print(f'    📍 {j["location"]}')
+            if j.get('url'):      print(f'    {j["url"]}')
+            print()
+
     elif command == 'company-employees':
         args = sys.argv[2:]
         slug = None; title = None; location = None; first_degree = '--1st' in args

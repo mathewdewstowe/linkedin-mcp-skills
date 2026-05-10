@@ -47,6 +47,8 @@ Always wait ~5–8 seconds between consecutive runs (Playwright profile lock).
 |---|---|
 | `company <slug>` | Company basics: name, tagline, industry, location, description, URN. Uses search-based lookup (legacy `/organization/companies` is dead). |
 | `company-employees <slug> [--title "X"] [--location "Y"] [--1st]` | Employees at a company, filterable by title/location. |
+| `company-size <slug>` | Accurate employee count + size band. |
+| `company-jobs <slug_or_id> [keywords] [count]` | Posted job listings at a company. |
 
 ### Conversations (read)
 | Command | What it does |
