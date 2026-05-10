@@ -1,0 +1,18 @@
+{
+  "name": "linkedin-voyager-marketplace",
+  "owner": {
+    "name": "Matthew Dewstowe",
+    "url": "https://github.com/mathewdewstowe"
+  },
+  "description": "LinkedIn Voyager API skill for Claude Code",
+  "plugins": [
+    {
+      "name": "linkedin-voyager",
+      "source": "./",
+      "description": "LinkedIn skill — Voyager API for search, messaging, post engagement, company research. Headless Playwright + dedicated Brave profile, no UI clicks.",
+      "version": "1.0.0",
+      "category": "productivity",
+      "keywords": ["linkedin", "voyager", "outbound", "sales", "recruiting", "research"]
+    }
+  ]
+}

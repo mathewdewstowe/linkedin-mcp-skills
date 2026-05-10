@@ -1,0 +1,16 @@
+{
+  "name": "linkedin-voyager",
+  "version": "1.0.0",
+  "description": "LinkedIn skill — Voyager API for search, messaging, post engagement, company research. Headless Playwright + dedicated Brave profile, no UI clicks.",
+  "author": {
+    "name": "Matthew Dewstowe",
+    "url": "https://github.com/mathewdewstowe"
+  },
+  "homepage": "https://github.com/mathewdewstowe/linkedin-mcp-skills",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mathewdewstowe/linkedin-mcp-skills.git"
+  },
+  "license": "MIT",
+  "keywords": ["linkedin", "voyager", "outbound", "sales", "recruiting", "search"]
+}
