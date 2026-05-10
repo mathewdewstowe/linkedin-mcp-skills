@@ -1127,6 +1127,109 @@ class LinkedInBrowser:
             'recent_posts': posts,
         }
 
+    def voyager_get_profile_current_company(self, linkedin_url: str) -> dict:
+        """
+        Get a person's CURRENT employer via Voyager positionGroups API.
+
+        Calls /voyager/api/identity/profiles/{publicId}/positionGroups which
+        returns Position objects (with timePeriod) and MiniCompany objects
+        (with universalName = slug).
+
+        Strategy:
+          1. Extract publicId from the LinkedIn URL
+          2. Fetch positionGroups endpoint (authenticated, in-browser)
+          3. Find the Position with no timePeriod.endDate → current role
+          4. Match its companyUrn to a MiniCompany in included[] → slug
+          5. Also extract industry + employeeCountRange from Position inline data
+
+        Returns dict: {company_slug, company_name, job_title, industry,
+                       employee_count, company_id}
+        company_slug will be '' if the company has no LinkedIn page.
+        """
+        import re as _re
+        empty = {
+            'company_slug': '', 'company_name': '', 'job_title': '',
+            'industry': '', 'employee_count': '', 'company_id': ''
+        }
+        if not linkedin_url or 'linkedin.com' not in linkedin_url:
+            return empty
+
+        # Extract public profile ID from URL
+        # Handles: /in/some-slug/, /in/some-slug?..., trailing slashes
+        m = _re.search(r'linkedin\.com/in/([^/?#]+)', linkedin_url)
+        if not m:
+            return empty
+        public_id = m.group(1).rstrip('/')
+
+        url = f'https://www.linkedin.com/voyager/api/identity/profiles/{public_id}/positionGroups'
+        data = self._voyager_fetch(url)
+        if not data:
+            return {**empty, 'error': 'positionGroups fetch failed'}
+
+        included = data.get('included', [])
+
+        # Build miniCompany lookup: entityUrn → {universalName, name, objectUrn}
+        mini_map = {}
+        for item in included:
+            if item.get('$type') == 'com.linkedin.voyager.entities.shared.MiniCompany':
+                urn = item.get('entityUrn', '')
+                if urn:
+                    mini_map[urn] = {
+                        'name':          item.get('name', ''),
+                        'universalName': item.get('universalName', ''),
+                        'objectUrn':     item.get('objectUrn', ''),
+                    }
+
+        # Find current position: Position with no timePeriod.endDate
+        positions = [i for i in included
+                     if i.get('$type') == 'com.linkedin.voyager.identity.profile.Position']
+
+        # Sort: no-endDate first, then by startDate descending
+        def sort_key(p):
+            tp = p.get('timePeriod', {})
+            has_end = 1 if tp.get('endDate') else 0
+            start = tp.get('startDate', {})
+            start_year = start.get('year', 0)
+            start_month = start.get('month', 0)
+            return (has_end, -start_year, -start_month)
+
+        positions.sort(key=sort_key)
+        current = positions[0] if positions else None
+
+        if not current:
+            return {**empty, 'error': 'no positions found'}
+
+        # Extract company info
+        company_urn = current.get('companyUrn', '')  # e.g. "urn:li:fs_miniCompany:33229823"
+        mini = mini_map.get(company_urn, {})
+        company_slug = mini.get('universalName', '')
+        company_name = current.get('companyName', '') or mini.get('name', '')
+
+        # company_id from objectUrn: "urn:li:company:33229823" → "33229823"
+        obj_urn = mini.get('objectUrn', '')
+        company_id = obj_urn.split(':')[-1] if obj_urn else ''
+
+        # Industry from inline company data
+        inline_co = current.get('company', {})
+        industries = inline_co.get('industries', [])
+        industry = industries[0] if industries else ''
+
+        # Employee count range
+        ec = inline_co.get('employeeCountRange', {})
+        if ec and ec.get('start'):
+            employee_count = f"{ec['start']}-{ec.get('end', ec['start'])}"
+        else:
+            employee_count = ''
+
+        return {
+            'company_slug':    company_slug,
+            'company_name':    company_name,
+            'job_title':       current.get('title', ''),
+            'industry':        industry,
+            'employee_count':  employee_count,
+            'company_id':      company_id,
+        }
+
     def voyager_get_profile_contact(self, slug: str) -> dict | None:
         """
         Get contact info via /voyager/api/identity/profiles/{slug}/profileContactInfo.
@@ -1302,6 +1405,53 @@ class LinkedInBrowser:
         # Nothing matched
         return None
 
+    def voyager_get_company_size(self, company_slug: str) -> dict:
+        """
+        Navigate to a company's 'about' page and extract:
+          - employee_count_range (e.g. "51-200 employees")
+          - employee_count_exact (clickable LinkedIn count if present)
+          - industry (text)
+          - hq (location)
+          - company_type (Public / Private / Self-employed / etc)
+          - founded (year if visible)
+        Returns dict with these fields.
+        """
+        page = self._page
+        slug = company_slug.rstrip('/').split('/')[-1].split('?')[0]
+        url = f'https://www.linkedin.com/company/{slug}/about/'
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=25000)
+            page.wait_for_timeout(2500)
+        except Exception:
+            return {}
+        # Extract via JS evaluation
+        try:
+            data = page.evaluate('''() => {
+                const out = { employee_count_range: '', employee_count_exact: '', industry: '', hq: '', company_type: '', founded: '', website: '' };
+                // The about page has dt/dd or h3/p pairs. Look for each label.
+                const allDt = Array.from(document.querySelectorAll('dt, h3, p, span'));
+                for (const el of allDt) {
+                    const t = el.textContent.trim().toLowerCase();
+                    if (!t || t.length > 30) continue;
+                    let next = el.nextElementSibling;
+                    if (!next) continue;
+                    const nt = next.textContent.trim();
+                    if (t === 'company size' && !out.employee_count_range) out.employee_count_range = nt;
+                    else if (t === 'industry' && !out.industry) out.industry = nt;
+                    else if ((t === 'headquarters' || t === 'location') && !out.hq) out.hq = nt;
+                    else if (t === 'type' && !out.company_type) out.company_type = nt;
+                    else if (t === 'founded' && !out.founded) out.founded = nt;
+                    else if (t === 'website' && !out.website) out.website = nt;
+                }
+                // Also search for the "X associated members" or "X employees" text
+                const memberMatch = document.body.textContent.match(/(\\d[\\d,]*)\\s+(?:associated members|employees on LinkedIn)/i);
+                if (memberMatch) out.employee_count_exact = memberMatch[1].replace(/,/g, '');
+                return out;
+            }''')
+            return data or {}
+        except Exception:
+            return {}
+
     def voyager_get_company_employees(self, slug: str, title: str | None = None,
                                       count: int = 20, first_degree_only: bool = False,
                                       location: str | None = None) -> list:
@@ -1366,6 +1516,103 @@ class LinkedInBrowser:
             if len(people) >= count:
                 break
         return people
+
+    def voyager_search_company_jobs(self, company_id: str, keywords: str = '', count: int = 50) -> list:
+        """
+        Get ALL open job postings at a specific company via Voyager API.
+        No keyword filter — returns everything, caller filters by sales keywords.
+        Uses voyagerJobsDashJobCards endpoint (confirmed working).
+        Returns list of job dicts: {title, url, urn}
+        """
+        # No keyword filter — get all jobs and filter client-side
+        kw_part = f'keywords:{keywords},' if keywords.strip() else ''
+        url = (
+            f'https://www.linkedin.com/voyager/api/voyagerJobsDashJobCards'
+            f'?decorationId=com.linkedin.voyager.dash.deco.jobs.search.JobSearchCardsCollection-220'
+            f'&count={count}'
+            f'&q=jobSearch'
+            f'&query=(origin:JOB_SEARCH_PAGE_OTHER_ENTRY,'
+            f'{kw_part}'
+            f'selectedFilters:(company:List({company_id})),'
+            f'spellCorrectionEnabled:true)'
+            f'&start=0'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+        jobs = []
+        for item in d.get('included', []):
+            if item.get('$type') != 'com.linkedin.voyager.dash.jobs.JobPosting':
+                continue
+            title = item.get('title', '')
+            urn = item.get('trackingUrn', '') or item.get('entityUrn', '')
+            job_id = urn.split(':')[-1] if urn else ''
+            jurl = f'https://www.linkedin.com/jobs/view/{job_id}/' if job_id else ''
+            if title:
+                jobs.append({'title': title, 'url': jurl, 'urn': urn})
+        return jobs
+
+    def voyager_search_company_jobs_page(self, company_slug: str,
+                                          search_query: str = 'sales',
+                                          company_id: str = '') -> list:
+        """
+        Search LinkedIn jobs filtered to a specific company using the jobs search URL.
+        Uses f_C (company filter) so results are company-specific.
+        Returns list of job title strings.
+        """
+        import re as _re
+        page = self._page
+        slug = company_slug.rstrip('/').split('/')[-1].split('?')[0]
+
+        # If no company_id passed, try to resolve it
+        cid = company_id
+        if not cid:
+            try:
+                comp = self.voyager_get_company(slug)
+                if comp:
+                    cid = comp.get('company_id', '')
+            except Exception:
+                pass
+
+        if not cid:
+            return []
+
+        from urllib.parse import quote as _q
+        kw = _q(search_query, safe='')
+        url = f'https://www.linkedin.com/jobs/search/?keywords={kw}&f_C={cid}&position=1&pageNum=0'
+
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=25000)
+            page.wait_for_timeout(4000)
+        except Exception:
+            return []
+
+        try:
+            jobs = page.evaluate('''() => {
+                const titles = new Set();
+                document.querySelectorAll("a[href*='/jobs/view/']").forEach(el => {
+                    // Prefer aria-label (cleanest source)
+                    let t = el.getAttribute("aria-label") || "";
+                    if (!t) {
+                        // Fall back to textContent, de-duplicate doubled text
+                        t = el.textContent.trim().replace(/\\s+/g, " ");
+                        t = t.replace(/^Job Title\\s+/i, "");
+                        // De-duplicate: "Account ExecutiveAccount Executive" -> "Account Executive"
+                        const half = Math.ceil(t.length / 2);
+                        for (let len = half; len >= 5; len--) {
+                            if (t.slice(0, len).trim() === t.slice(len).trim()) {
+                                t = t.slice(0, len).trim();
+                                break;
+                            }
+                        }
+                    }
+                    if (t && t.length > 3 && t.length < 120) titles.add(t.trim());
+                });
+                return [...titles];
+            }''')
+            return jobs or []
+        except Exception:
+            return []
 
     # ── Feed ──────────────────────────────────────────────────────────── #
 
@@ -1645,62 +1892,205 @@ class LinkedInBrowser:
         m = _re.search(r'urn:li:geo:(\d+)', _json.dumps(d))
         return m.group(1) if m else None
 
+    # LinkedIn industry URN map — add more as needed
+    INDUSTRY_URN_MAP = {
+        # Core tech
+        'software development': '4',
+        'computer software': '4',
+        'it services and it consulting': '96',
+        'information technology and services': '96',
+        'it services': '96',
+        'internet': '6',
+        'internet publishing': '6',
+        'technology, information and internet': '6',
+        'computer & network security': '118',
+        'computer network security': '118',
+        'cybersecurity': '118',
+        'computer hardware': '3',
+        'computer networking products': '5',
+        'computer networking': '5',
+        'telecommunications': '8',
+        'wireless': '7',
+        'data infrastructure and analytics': '3247',
+        'information services': '84',
+        'mobile computing software products': '1810',
+        # Vertical SaaS plays
+        'financial services': '43',
+        'fintech': '1742',
+        'insurance': '42',
+        'banking': '41',
+        'investment banking': '45',
+        'investment management': '50',
+        'real estate': '44',
+        'marketing and advertising': '80',
+        'marketing services': '80',
+        'advertising services': '80',
+        'legal services': '10',
+        'e-learning': '132',
+        'e-learning providers': '132',
+        'higher education': '68',
+        'hospital & health care': '14',
+        'hospitals and health care': '14',
+        'pharmaceuticals': '15',
+        'biotechnology': '16',
+        'biotechnology research': '16',
+        'staffing and recruiting': '104',
+        'human resources services': '137',
+        'management consulting': '11',
+        'business consulting and services': '11',
+        'media production': '126',
+        'broadcast media': '36',
+        'publishing': '82',
+        'newspaper publishing': '81',
+        'professional training and coaching': '105',
+        'venture capital and private equity principals': '106',
+    }
+
+    def voyager_industry_lookup(self, industry: str) -> str | None:
+        """Resolve an industry string to a LinkedIn industry URN id.
+        Uses hardcoded map first, then typeahead as fallback."""
+        key = industry.lower().strip()
+        if key in self.INDUSTRY_URN_MAP:
+            return self.INDUSTRY_URN_MAP[key]
+        # Typeahead fallback
+        url = (
+            'https://www.linkedin.com/voyager/api/graphql'
+            '?queryId=voyagerSearchDashReusableTypeahead.b8f1adee2f8def6d50d4d54b2b8b4a76'
+            f'&variables=(query:(typeaheadUseCase:INDUSTRY,keywords:{quote(industry, safe="")}))'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return None
+        import json as _json, re as _re
+        m = _re.search(r'urn:li:industry:(\d+)', _json.dumps(d))
+        return m.group(1) if m else None
+
     def voyager_search_people(self, query: str = '', title: str | None = None,
-                              first_degree_only: bool = False, count: int = 20,
+                              first_degree_only: bool = False, count: int = 500,
                               location: str | None = None,
                               title_strict: bool = False,
-                              titles_any: list | None = None) -> list:
+                              titles_any: list | None = None,
+                              industry: str | None = None,
+                              industries_any: list | None = None,
+                              page_size: int = 49,
+                              delay_between_pages: float = 8.0) -> list:
         """
-        Search people via Voyager GraphQL search.
+        Search people via Voyager GraphQL search — paginated, server-side title filter.
 
         Args:
           query: keywords for full-text search
-          title: job title — when title_strict=True, ONLY headline is matched
+          title: job title — uses server-side (key:title,...) filter for accuracy
+          titles_any: list of titles — each searched separately and merged (OR logic)
           first_degree_only: filter to 1st-degree connections
-          location: optional location filter (matched against secondarySubtitle)
-          title_strict: if True, require `title` substring to appear in headline
+          location: optional location name, resolved to geoUrn server-side
+          title_strict: legacy param — server-side filter is accurate by default now
+          count: max total results to return (default 500)
+          page_size: LinkedIn page size, default 49 (do not lower — causes cutoff)
+          delay_between_pages: seconds to sleep between pages (default 8.0)
 
         Returns list of dicts: slug, name, headline, location, profile_url, urn.
         """
-        # Build keyword: free-text query, or first title in list, or single title
-        kw = query
-        if not kw:
-            if titles_any:
-                kw = ' OR '.join(f'"{t}"' for t in titles_any)
-            elif title:
-                kw = title
+        # If titles_any has multiple titles, recurse once per title and merge
+        if titles_any and len(titles_any) > 1:
+            all_people, seen_slugs = [], set()
+            for t in titles_any:
+                results = self.voyager_search_people(
+                    query=query, title=t, first_degree_only=first_degree_only,
+                    count=count, location=location, title_strict=True,
+                    titles_any=None, industry=industry, industries_any=industries_any,
+                    page_size=page_size,
+                    delay_between_pages=delay_between_pages,
+                )
+                for p in results:
+                    if p['slug'] not in seen_slugs:
+                        seen_slugs.add(p['slug'])
+                        all_people.append(p)
+            return all_people
+
+        # If industries_any has multiple, recurse once per industry and merge
+        if industries_any and len(industries_any) > 1:
+            all_people, seen_slugs = [], set()
+            for ind in industries_any:
+                results = self.voyager_search_people(
+                    query=query, title=title, first_degree_only=first_degree_only,
+                    count=count, location=location, title_strict=title_strict,
+                    titles_any=None, industry=ind, industries_any=None,
+                    page_size=page_size,
+                    delay_between_pages=delay_between_pages,
+                )
+                for p in results:
+                    if p['slug'] not in seen_slugs:
+                        seen_slugs.add(p['slug'])
+                        p['industry_matched'] = ind
+                        all_people.append(p)
+            return all_people
+
+        # Keyword for the free-text field
+        effective_title = (titles_any[0] if titles_any else title) or ''
+        kw = query or effective_title
+
         # Resolve location → geoUrn for server-side filtering
+        HARDCODED_URNS = {
+            'uk': '101165590', 'united kingdom': '101165590',
+            'england': '102299470', 'scotland': '104049318',
+            'wales': '100268168', 'northern ireland': '104233521',
+            'london': '90009496', 'manchester': '103940630',
+            'birmingham': '102445284', 'bristol': '105154330',
+            'edinburgh': '104075587', 'cardiff': '104989790',
+        }
         geo_id = None
         if location:
-            geo_id = self.voyager_geo_lookup(location)
+            geo_id = HARDCODED_URNS.get(location.lower()) or self.voyager_geo_lookup(location)
             if geo_id:
                 print(f'  [search] Resolved "{location}" → geoUrn {geo_id}')
             else:
-                print(f'  [search] Could not resolve location "{location}" — falling back to client-side filter')
+                print(f'  [search] Could not resolve location "{location}" — client-side fallback')
+
+        # Resolve industry → industry URN for server-side filtering
+        industry_id = None
+        if industry:
+            industry_id = self.voyager_industry_lookup(industry)
+            if industry_id:
+                print(f'  [search] Resolved industry "{industry}" → industry URN {industry_id}')
+            else:
+                print(f'  [search] Could not resolve industry "{industry}"')
+
+        # Build server-side queryParameters filter list
         filters = 'List((key:resultType,value:List(PEOPLE))'
         if first_degree_only:
             filters += ',(key:network,value:List(F))'
         if geo_id:
             filters += f',(key:geoUrn,value:List({geo_id}))'
+        if industry_id:
+            filters += f',(key:industry,value:List({industry_id}))'
+        # Server-side title filter — far more accurate than client-side headline matching
+        if effective_title:
+            filters += f',(key:title,value:List({quote(effective_title, safe="")}))'
         filters += ')'
-        variables = (
-            f'(query:(keywords:{quote(kw, safe="")},'
-            f'flagshipSearchIntent:SEARCH_SRP,'
-            f'queryParameters:{filters},'
-            f'includeFiltersInResponse:false))'
-        )
-        url = (
-            'https://www.linkedin.com/voyager/api/graphql'
-            '?queryId=voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0'
-            f'&variables={variables}'
-        )
-        d = self._voyager_fetch(url)
-        people, seen = [], set()
 
-        if d:
+        # Paginated fetch loop — page_size=49 is required to avoid early cutoff
+        people, seen = [], set()
+        for page in range(50):           # max 50 pages ≈ 2,450 results
+            start = page * page_size
+            variables = (
+                f'(query:(keywords:{quote(kw, safe="")},'
+                f'flagshipSearchIntent:SEARCH_SRP,'
+                f'queryParameters:{filters},'
+                f'includeFiltersInResponse:false),'
+                f'start:{start},count:{page_size})'
+            )
+            url = (
+                'https://www.linkedin.com/voyager/api/graphql'
+                '?queryId=voyagerSearchDashClusters.b0928897b71bd00a5a7291755dcd64f0'
+                f'&variables={variables}'
+            )
+            d = self._voyager_fetch(url)
+            if not d:
+                break
+
+            page_people = []
             for item in d.get('included', []):
-                t = item.get('$type', '')
-                if 'EntityResultViewModel' not in t:
+                if 'EntityResultViewModel' not in item.get('$type', ''):
                     continue
                 name     = (item.get('title') or {}).get('text', '')
                 headline = (item.get('primarySubtitle') or {}).get('text', '')
@@ -1710,26 +2100,12 @@ class LinkedInBrowser:
                 urn      = item.get('entityUrn', '')
                 if not name or not slug or slug in seen:
                     continue
-
-                # OR list of titles — match if ANY appears in headline
-                if titles_any:
-                    if not any(t.lower() in headline.lower() for t in titles_any):
-                        continue
-                # Single strict title filter — must appear in headline
-                elif title and title_strict:
-                    if title.lower() not in headline.lower():
-                        continue
-                elif title and not title_strict:
-                    if title.lower() not in (headline + ' ' + name).lower():
-                        continue
-
-                # Client-side location filter only if geoUrn lookup failed
+                # Client-side location fallback only when geoUrn resolution failed
                 if location and not geo_id:
                     if location.lower() not in loc.lower():
                         continue
-
                 seen.add(slug)
-                people.append({
+                page_people.append({
                     'slug':        slug,
                     'name':        name,
                     'headline':    headline,
@@ -1737,9 +2113,21 @@ class LinkedInBrowser:
                     'urn':         urn,
                     'profile_url': f'https://www.linkedin.com/in/{slug}/',
                 })
-                if len(people) >= count:
-                    break
-        return people
+
+            people.extend(page_people)
+            total_hint = ''
+            try:
+                total_hint = f" / {d['data']['data']['searchDashClustersByAll']['paging']['total']} total"
+            except (KeyError, TypeError):
+                pass
+            print(f'  [search] page {page + 1}: +{len(page_people)} (running: {len(people)}{total_hint})')
+
+            if len(page_people) == 0 or len(people) >= count:
+                break
+
+            time.sleep(delay_between_pages)
+
+        return people[:count]
 
     def voyager_get_profile_posts(self, slug_or_urn: str, count: int = 10) -> list:
         """

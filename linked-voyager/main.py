@@ -100,6 +100,8 @@ def main():
         title = None
         titles_any = None
         location = None
+        industry = None
+        industries_any = None
         no_location = '--no-location' in args
         positional = []
         i = 0
@@ -119,12 +121,20 @@ def main():
                 location = a.split('=', 1)[1]
             elif a == '--location' and i + 1 < len(args):
                 location = args[i + 1]; i += 1
+            elif a.startswith('--industry='):
+                industry = a.split('=', 1)[1]
+            elif a == '--industry' and i + 1 < len(args):
+                industry = args[i + 1]; i += 1
+            elif a.startswith('--industry-any='):
+                industries_any = [t.strip() for t in a.split('=', 1)[1].split(',') if t.strip()]
+            elif a == '--industry-any' and i + 1 < len(args):
+                industries_any = [t.strip() for t in args[i + 1].split(',') if t.strip()]; i += 1
             else:
                 positional.append(a)
             i += 1
         query = ' '.join(positional)
         if not query and not title and not titles_any:
-            print('❌ Usage: search-people [<query>] [--1st] [--title "X"] [--title-any "X,Y,Z"] [--location "UK"] [--no-location]')
+            print('❌ Usage: search-people [<query>] [--1st] [--title "X"] [--title-any "X,Y,Z"] [--location "UK"] [--no-location] [--industry "Software Development"] [--industry-any "X,Y"]')
             return
         # Default location to UK unless explicitly disabled
         if not location and not no_location:
@@ -137,11 +147,14 @@ def main():
                 query, title=title, first_degree_only=first_degree,
                 location=location, title_strict=title_strict,
                 titles_any=titles_any,
+                industry=industry, industries_any=industries_any,
             )
         label_parts = []
         if query:       label_parts.append(f'"{query}"')
         if title:       label_parts.append(f'title="{title}"' + (' (strict)' if title_strict else ''))
         if titles_any:  label_parts.append(f'title-any={titles_any}')
+        if industry:    label_parts.append(f'industry="{industry}"')
+        if industries_any: label_parts.append(f'industry-any={industries_any}')
         if location:    label_parts.append(f'location="{location}"')
         if first_degree: label_parts.append('1st-degree')
         print(f'\nFound {len(people)} people for {" ".join(label_parts)}:\n')

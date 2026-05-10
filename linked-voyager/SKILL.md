@@ -28,7 +28,9 @@ Always wait ~5–8 seconds between consecutive runs (Playwright profile lock).
 ### People & profiles
 | Command | What it does |
 |---|---|
-| `search-people [<query>] [--1st] [--title "X"] [--title-any "A,B,C"] [--location "Y"] [--no-location]` | People search. **Default location = UK**. `--title` strict (headline-only) when no free-text query. `--title-any` matches if ANY title appears. `--location` resolves to LinkedIn `geoUrn` for server-side filter. Hardcoded geoUrns: UK, England, Scotland, Wales, NI, London, Manchester, Birmingham, Bristol, Edinburgh, Cardiff, etc. |
+| `search-people [<query>] [--1st] [--title "X"] [--title-any "A,B,C"] [--location "Y"] [--no-location] [--industry "X"] [--industry-any "A,B"]` | People search. **Default location = UK**. `--title` strict (headline-only) when no free-text query. `--title-any` matches if ANY title appears. `--industry` / `--industry-any` filter by current company industry (resolves to LinkedIn industryUrn). `--location` resolves to `geoUrn` server-side. Hardcoded geoUrns: UK, England, Scotland, Wales, NI, London, Manchester, Birmingham, Bristol, Edinburgh, Cardiff, etc. |
+| `profile-current-company <linkedin_url>` | Current employer for a person — slug, name, job title, industry, employee count. |
+| `company-jobs <slug_or_id> [keywords] [count]` | Job postings at a company. |
 | `profile-posts <slug_or_url> [count]` | Person's recent original posts with reaction/comment counts. |
 | `profile-activity <slug_or_url> [count]` | All recent activity (posts + likes + comments + reposts). |
 
