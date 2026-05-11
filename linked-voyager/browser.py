@@ -1,26 +1,60 @@
 """
-LinkedInBrowser — Playwright browser automation for LinkedIn actions
-that cannot be done via direct Voyager API (invite send, withdraw, search).
+LinkedInBrowser — Playwright browser automation for LinkedIn actions.
 
-LinkedIn has migrated most UI actions to SDUI (Server-Driven UI) which
-calls Voyager server-side. Browser automation is the only reliable path.
-
-Uses the dedicated Brave profile at ~/.brave-paginator/profile which
-already has an active LinkedIn session.
+Profile selection (set LI_PROFILE env var):
+  sonesse  (default) → Brave  + Playwright  (matthew@sonesse.ai)
+  matthew             → Chrome cookies + direct HTTP (matthewdewstowe@gmail.com)
+                        Uses browser_cookie3 — Chrome must be running & logged in.
 """
 
+import os
 import time
 import random
+from typing import Optional, Union
 from urllib.parse import quote
 from datetime import datetime
 
 
-BRAVE_EXE = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'
-PROFILE_DIR = '/Users/matthew_dewstowe/.brave-paginator/profile'
+BRAVE_EXE   = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'
+CHROME_EXE  = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+
+_LI_PROFILE = os.environ.get('LI_PROFILE', 'sonesse')
+
+# matthew profile uses direct HTTP via browser_cookie3 — no Playwright needed
+USE_DIRECT_HTTP = (_LI_PROFILE == 'matthew')
+
+_PROFILES = {
+    'sonesse': {'exe': BRAVE_EXE,  'dir': '/Users/matthew_dewstowe/.brave-paginator/profile'},
+    'matthew': {'exe': CHROME_EXE, 'dir': '/Users/matthew_dewstowe/.chrome-paginator/profile-matthew'},
+}
+_active     = _PROFILES.get(_LI_PROFILE, _PROFILES['sonesse'])
+PROFILE_DIR = _active['dir']
+BROWSER_EXE = _active['exe']
+
+
+def _make_direct_session():
+    """Build a requests.Session using live Chrome cookies via browser_cookie3."""
+    import requests, browser_cookie3
+    cj = browser_cookie3.chrome(domain_name='.linkedin.com')
+    cookies = {c.name: c.value for c in cj}
+    jsid = cookies.get('JSESSIONID', '').strip('"')
+    session = requests.Session()
+    session.cookies.update(cookies)
+    session.headers.update({
+        'csrf-token': jsid,
+        'accept': 'application/vnd.linkedin.normalized+json+2.1',
+        'x-restli-protocol-version': '2.0.0',
+        'x-li-lang': 'en_US',
+        'user-agent': (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        ),
+    })
+    return session
 
 
 class LinkedInBrowser:
-    """Context manager that wraps a persistent Brave/Chromium browser session."""
+    """Context manager that wraps either a Playwright browser or a direct HTTP session."""
 
     def __init__(self, headless=False, slow_mo=400):
         self.headless = headless
@@ -28,27 +62,30 @@ class LinkedInBrowser:
         self._pw = None
         self._context = None
         self._page = None
+        self._session = None   # requests.Session when USE_DIRECT_HTTP
 
     def __enter__(self):
+        if USE_DIRECT_HTTP:
+            self._session = _make_direct_session()
+            return self
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
         self._context = self._pw.chromium.launch_persistent_context(
             user_data_dir=PROFILE_DIR,
-            executable_path=BRAVE_EXE,
+            executable_path=BROWSER_EXE,
             headless=self.headless,
             slow_mo=self.slow_mo,
             args=['--no-sandbox', '--disable-blink-features=AutomationControlled']
         )
         pages = self._context.pages
-        if pages:
-            # Reuse the first existing tab — never open a new one
-            self._page = pages[0]
-        else:
-            self._page = self._context.new_page()
+        self._page = pages[0] if pages else self._context.new_page()
         return self
 
     def __exit__(self, *args):
-        # Close only the Playwright connection — leave Brave running with its tabs intact
+        if USE_DIRECT_HTTP:
+            self._session = None
+            return
+        # Leave Brave running — only close the Playwright connection
         try:
             if self._context:
                 self._context.close()
@@ -68,7 +105,7 @@ class LinkedInBrowser:
         """
         Navigate to /in/{slug}/ and click Connect → Send without a note.
 
-        Returns: {'success': bool, 'error': str | None}
+        Returns: {'success': bool, 'error': str}
         """
         page = self._page
         print(f'  [Browser] Loading /in/{profile_slug}/')
@@ -146,7 +183,7 @@ class LinkedInBrowser:
         Navigate to a profile and withdraw a pending invite by clicking
         the Withdraw button (either on profile page or via invitation manager).
 
-        Returns: {'success': bool, 'error': str | None}
+        Returns: {'success': bool, 'error': str}
         """
         page = self._page
         print(f'  [Browser] Withdrawing invite for {profile_slug}')
@@ -642,13 +679,20 @@ class LinkedInBrowser:
 
     def _ensure_linkedin_page(self):
         """Make sure the current page is on linkedin.com so cookies are accessible."""
+        if USE_DIRECT_HTTP:
+            return  # no browser page needed
         current = self._page.url or ''
         if 'linkedin.com' not in current:
             self._page.goto('https://www.linkedin.com/feed/', wait_until='domcontentloaded', timeout=20000)
             self._page.wait_for_timeout(1500)
 
-    def _voyager_fetch(self, url: str) -> dict | None:
-        """Run a Voyager API GET in the browser page and return parsed JSON."""
+    def _voyager_fetch(self, url: str) -> dict:
+        """Run a Voyager API GET and return parsed JSON."""
+        if USE_DIRECT_HTTP:
+            r = self._session.get(url)
+            if r.status_code != 200:
+                return None
+            return r.json()
         self._ensure_linkedin_page()
         result = self._page.evaluate('''async (url) => {
             const m = document.cookie.match(/JSESSIONID="?([^";]+)"?/);
@@ -674,7 +718,7 @@ class LinkedInBrowser:
         """Encode a URN for Restli variables — encodes : ( ) , =."""
         return quote(urn, safe='')
 
-    def _voyager_my_urn(self) -> str | None:
+    def _voyager_my_urn(self) -> str:
         """Return cached fsd_profile URN, resolving via /me if needed."""
         if not getattr(self, '_my_urn', None):
             self.voyager_get_me()
@@ -682,7 +726,7 @@ class LinkedInBrowser:
 
     # ── Auth ──────────────────────────────────────────────────────────── #
 
-    def voyager_get_me(self) -> dict | None:
+    def voyager_get_me(self) -> dict:
         """
         GET /voyager/api/me via browser.
         Caches fsd_profile URN in self._my_urn.
@@ -1089,11 +1133,68 @@ class LinkedInBrowser:
         'paris':            '104246759',
         'berlin':            '106967730',
         'dublin':            '104738515',
+        'united states':    '103644278',
+        'usa':              '103644278',
+        'us':               '103644278',
+        'america':          '103644278',
     }
 
     # ── Profile (full) ────────────────────────────────────────────────── #
 
-    def voyager_get_profile_full(self, slug: str) -> dict | None:
+    def voyager_resolve_slug_to_urn(self, slug: str) -> str:
+        """
+        Resolve a LinkedIn public profile slug to an fsd_profile URN.
+        Strategy:
+          1. Try direct profile API (works for many slugs)
+          2. Fall back to people search — strip numeric suffix, search by name,
+             match exact slug or best-guess first result
+        Returns 'urn:li:fsd_profile:...' or '' on failure.
+        """
+        import re as _re
+
+        def _extract_urn(data):
+            if not data:
+                return ''
+            entity_urn = data.get('entityUrn', '')
+            if entity_urn and 'fsd_profile' in entity_urn:
+                return entity_urn
+            for item in (data.get('included', []) or []):
+                urn = item.get('entityUrn', '')
+                if urn and 'fsd_profile' in urn:
+                    return urn
+            mini = data.get('miniProfile', {}) or {}
+            obj_urn = mini.get('objectUrn', '')
+            if obj_urn and 'fs_miniProfile' in obj_urn:
+                return obj_urn.replace('fs_miniProfile:', 'fsd_profile:')
+            return ''
+
+        # 1. Direct profile API
+        url = f'https://www.linkedin.com/voyager/api/identity/profiles/{slug}'
+        data = self._voyager_fetch(url)
+        urn = _extract_urn(data)
+        if urn:
+            return urn
+
+        # 2. Search fallback — strip trailing hex/numeric suffix for query
+        name_part = _re.sub(r'-[0-9a-f]{6,}$', '', slug, flags=_re.IGNORECASE)
+        # Also strip pure-numeric suffix (e.g. -123456)
+        name_part = _re.sub(r'-\d{5,}$', '', name_part)
+        query = name_part.replace('-', ' ').strip()
+        if not query:
+            query = slug
+
+        # Search 1st-degree only — avoids matching wrong person with same name
+        people = self.voyager_search_people(query, count=10, first_degree_only=True)
+        # Prefer exact slug match, then first result
+        match = next((p for p in people if p.get('slug', '').lower() == slug.lower()), None)
+        if not match and people:
+            match = people[0]
+        if match:
+            m = _re.search(r'(urn:li:fsd_profile:[^,)]+)', match.get('urn', ''))
+            return m.group(1) if m else ''
+        return ''
+
+    def voyager_get_profile_full(self, slug: str) -> dict:
         """
         Get profile data — uses search + profile activity since legacy
         /profileView endpoint is deprecated. Returns name, headline, location,
@@ -1210,12 +1311,12 @@ class LinkedInBrowser:
         company_id = obj_urn.split(':')[-1] if obj_urn else ''
 
         # Industry from inline company data
-        inline_co = current.get('company', {})
-        industries = inline_co.get('industries', [])
+        inline_co = current.get('company') or {}
+        industries = inline_co.get('industries', []) if inline_co else []
         industry = industries[0] if industries else ''
 
         # Employee count range
-        ec = inline_co.get('employeeCountRange', {})
+        ec = inline_co.get('employeeCountRange', {}) if inline_co else {}
         if ec and ec.get('start'):
             employee_count = f"{ec['start']}-{ec.get('end', ec['start'])}"
         else:
@@ -1230,7 +1331,7 @@ class LinkedInBrowser:
             'company_id':      company_id,
         }
 
-    def voyager_get_profile_contact(self, slug: str) -> dict | None:
+    def voyager_get_profile_contact(self, slug: str) -> dict:
         """
         Get contact info via /voyager/api/identity/profiles/{slug}/profileContactInfo.
         Returns dict with: email, phones[], websites[], twitter, ims, birthday.
@@ -1330,7 +1431,7 @@ class LinkedInBrowser:
 
     # ── Company ───────────────────────────────────────────────────────── #
 
-    def voyager_get_company(self, slug: str) -> dict | None:
+    def voyager_get_company(self, slug: str) -> dict:
         """
         Get company info via search (legacy /organization/companies is deprecated).
         Returns dict with: name, tagline, industry, urn, company_id, public_url.
@@ -1452,9 +1553,9 @@ class LinkedInBrowser:
         except Exception:
             return {}
 
-    def voyager_get_company_employees(self, slug: str, title: str | None = None,
+    def voyager_get_company_employees(self, slug: str, title: str = None,
                                       count: int = 20, first_degree_only: bool = False,
-                                      location: str | None = None) -> list:
+                                      location: str = None) -> list:
         """
         Get employees at a company, optionally filtered by job title.
         Uses voyagerSearchDashClusters with currentCompany filter.
@@ -1663,6 +1764,70 @@ class LinkedInBrowser:
                 break
         return posts
 
+    # ── Connections ───────────────────────────────────────────────────── #
+
+    def voyager_get_recent_connections(self, count: int = 50,
+                                       since_hours=None) -> list:
+        """
+        List your connections sorted by most-recently-added.
+        Equivalent to: LinkedIn → My Network → Connections → Recently added.
+
+        Args:
+          count: how many to return (max ~100 per LinkedIn page)
+          since_hours: optional — only return connections accepted within
+                       the last N hours (client-side filter on createdAt)
+
+        Returns list of dicts: name, headline, slug, profile_url, urn,
+                               connected_at (ms epoch), connected_at_iso
+        """
+        url = (
+            'https://www.linkedin.com/voyager/api/relationships/connections'
+            f'?count={count}&start=0&sortType=RECENTLY_ADDED'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return []
+
+        # Build profile lookup from included
+        profiles = {}
+        for it in d.get('included', []):
+            if 'MiniProfile' in it.get('$type', ''):
+                profiles[it.get('entityUrn', '')] = it
+
+        import time as _time
+        now_ms = int(_time.time() * 1000)
+        cutoff = (now_ms - since_hours * 3600 * 1000) if since_hours else 0
+
+        # Connections are in `included` (not `elements`) as Connection objects.
+        # Each references a MiniProfile via *miniProfile.
+        from datetime import datetime as _dt
+        connections = []
+        for it in d.get('included', []):
+            if it.get('$type') != 'com.linkedin.voyager.relationships.shared.connection.Connection':
+                continue
+            created_at = it.get('createdAt', 0)
+            if since_hours and created_at < cutoff:
+                continue
+            mini_urn = it.get('*miniProfile', '')
+            profile = profiles.get(mini_urn, {})
+            first   = profile.get('firstName', '')
+            last_n  = profile.get('lastName', '')
+            slug    = profile.get('publicIdentifier', '')
+            headline= profile.get('occupation', '') or profile.get('headline', '')
+            iso = _dt.utcfromtimestamp(created_at / 1000).strftime('%Y-%m-%d %H:%M UTC') if created_at else ''
+            connections.append({
+                'name':             f'{first} {last_n}'.strip(),
+                'headline':         headline,
+                'slug':             slug,
+                'profile_url':      f'https://www.linkedin.com/in/{slug}/' if slug else '',
+                'urn':              profile.get('entityUrn', ''),
+                'connected_at':     created_at,
+                'connected_at_iso': iso,
+            })
+        # Sort newest first (just in case)
+        connections.sort(key=lambda c: c['connected_at'], reverse=True)
+        return connections
+
     # ── Invites ───────────────────────────────────────────────────────── #
 
     def voyager_get_invites_received(self, count: int = 50) -> list:
@@ -1745,7 +1910,7 @@ class LinkedInBrowser:
 
     # ── Reactions / comments ──────────────────────────────────────────── #
 
-    def voyager_create_post(self, text: str, visibility: str = 'PUBLIC') -> dict | None:
+    def voyager_create_post(self, text: str, visibility: str = 'PUBLIC') -> dict:
         """
         Create a new LinkedIn post.
         visibility: PUBLIC | CONNECTIONS
@@ -1872,7 +2037,7 @@ class LinkedInBrowser:
             return False
         return True
 
-    def voyager_geo_lookup(self, location: str) -> str | None:
+    def voyager_geo_lookup(self, location: str) -> str:
         """Resolve a location string to a LinkedIn geoUrn id.
         Uses hardcoded map first, then typeahead as fallback."""
         key = location.lower().strip()
@@ -1946,7 +2111,7 @@ class LinkedInBrowser:
         'venture capital and private equity principals': '106',
     }
 
-    def voyager_industry_lookup(self, industry: str) -> str | None:
+    def voyager_industry_lookup(self, industry: str) -> str:
         """Resolve an industry string to a LinkedIn industry URN id.
         Uses hardcoded map first, then typeahead as fallback."""
         key = industry.lower().strip()
@@ -1965,13 +2130,13 @@ class LinkedInBrowser:
         m = _re.search(r'urn:li:industry:(\d+)', _json.dumps(d))
         return m.group(1) if m else None
 
-    def voyager_search_people(self, query: str = '', title: str | None = None,
+    def voyager_search_people(self, query: str = '', title: str = None,
                               first_degree_only: bool = False, count: int = 500,
-                              location: str | None = None,
+                              location: str = None,
                               title_strict: bool = False,
-                              titles_any: list | None = None,
-                              industry: str | None = None,
-                              industries_any: list | None = None,
+                              titles_any: list = None,
+                              industry: str = None,
+                              industries_any: list = None,
                               page_size: int = 49,
                               delay_between_pages: float = 8.0) -> list:
         """
@@ -2269,7 +2434,7 @@ class LinkedInBrowser:
         }''')
         return token
 
-    def get_profile_urn(self, slug: str) -> str | None:
+    def get_profile_urn(self, slug: str) -> str:
         """
         Get fsd_profile URN for a LinkedIn slug via GraphQL Voyager API.
         Returns urn:li:fsd_profile:ACoAA... or None.

@@ -50,6 +50,11 @@ Always wait ~5–8 seconds between consecutive runs (Playwright profile lock).
 | `company-size <slug>` | Accurate employee count + size band. |
 | `company-jobs <slug_or_id> [keywords] [count]` | Posted job listings at a company. |
 
+### Connections
+| Command | What it does |
+|---|---|
+| `recent-connections [count] [--since-hours N] [--since-days N]` | List your most recently-accepted connections, sorted newest first. Equivalent to "My Network → Connections → Sort by Recently Added". Use `--since-hours 24` for last 24h. |
+
 ### Conversations (read)
 | Command | What it does |
 |---|---|

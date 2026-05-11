@@ -354,13 +354,8 @@ def main():
         with LinkedInBrowser(headless=True) as br:
             r = br.voyager_get_profile_current_company(url)
         if not r or not r.get('company_name'):
-            print('❌ Could not resolve current company'); return
-        print(f'\n{r["company_name"]}')
-        if r.get('job_title'):     print(f'  Job title:     {r["job_title"]}')
-        if r.get('industry'):      print(f'  Industry:      {r["industry"]}')
-        if r.get('employee_count'):print(f'  Employees:     {r["employee_count"]}')
-        if r.get('company_slug'):  print(f'  Slug:          {r["company_slug"]}')
-        if r.get('company_id'):    print(f'  Company ID:    {r["company_id"]}')
+            print('{}'); return
+        print(json.dumps(r))
 
     elif command == 'company-size':
         slug = sys.argv[2] if len(sys.argv) > 2 else None
@@ -429,6 +424,37 @@ def main():
             print(f'  {p["author"]} — 👍 {p["reactions"]}  💬 {p["comments"]}')
             print(f'    {p["post_url"]}')
             if p['text']: print(f'    "{p["text"][:150]}..."')
+            print()
+
+    elif command == 'recent-connections':
+        # recent-connections [count] [--since-hours N] [--since-days N]
+        args = sys.argv[2:]
+        count = 50
+        since_hours = None
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a.startswith('--since-hours='):
+                since_hours = int(a.split('=', 1)[1])
+            elif a == '--since-hours' and i + 1 < len(args):
+                since_hours = int(args[i + 1]); i += 1
+            elif a.startswith('--since-days='):
+                since_hours = int(a.split('=', 1)[1]) * 24
+            elif a == '--since-days' and i + 1 < len(args):
+                since_hours = int(args[i + 1]) * 24; i += 1
+            elif a.isdigit():
+                count = int(a)
+            i += 1
+        from browser import LinkedInBrowser
+        with LinkedInBrowser(headless=True) as br:
+            conns = br.voyager_get_recent_connections(count=count, since_hours=since_hours)
+        label = f'last {since_hours}h' if since_hours else 'recently added'
+        print(f'\n{len(conns)} connections ({label}):\n')
+        for c in conns:
+            print(f'  {c["name"]}')
+            print(f'    {c["headline"]}')
+            print(f'    🕒 {c["connected_at_iso"]}')
+            print(f'    {c["profile_url"]}')
             print()
 
     elif command == 'invites-received':
@@ -542,6 +568,49 @@ def main():
 
         if ok:
             print(f'✅ Message sent to {person["name"]}')
+        else:
+            print(f'❌ Failed to send message')
+
+    elif command == 'message-url':
+        # message-url "<linkedin_url_or_slug>" "<message text>"
+        # Uses slug exact-match so we hit the RIGHT person, not a random namesake
+        if len(sys.argv) < 4:
+            print('❌ Usage: message-url "<linkedin_url_or_slug>" "<message text>"')
+            return
+        url_or_slug  = sys.argv[2]
+        message_text = ' '.join(sys.argv[3:])
+
+        # Extract slug from URL
+        import re as _re
+        slug = url_or_slug.rstrip('/').split('/')[-1].split('?')[0]
+        print(f'Resolving slug: {slug}')
+
+        from browser import LinkedInBrowser
+        with LinkedInBrowser(headless=True) as br:
+            # Resolve slug directly via profile API (works for numeric suffixes too)
+            fsd_urn = br.voyager_resolve_slug_to_urn(slug)
+            if not fsd_urn:
+                print(f'❌ Could not resolve slug to URN: {slug}')
+                return
+            print(f'Resolved URN: {fsd_urn}')
+
+            # Check for existing conversation
+            convs = br.voyager_get_conversations(count=100)
+            existing = next(
+                (c for c in convs if slug in c.get('participant_url', '')),
+                None
+            )
+            if existing:
+                print(f'Found existing conversation — sending...')
+                ok = br.voyager_send_message(existing['conversation_urn'], message_text)
+                person_name = slug
+            else:
+                print(f'No existing conversation — starting new one...')
+                ok = br.voyager_start_conversation(fsd_urn, message_text)
+                person_name = slug
+
+        if ok:
+            print(f'✅ Message sent to {person_name}')
         else:
             print(f'❌ Failed to send message')
 
