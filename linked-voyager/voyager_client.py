@@ -1,3 +1,4 @@
+from typing import Optional, Union
 """
 LinkedIn Voyager API Client — Direct HTTP Endpoints
 
@@ -51,7 +52,7 @@ class VoyagerClient:
         self.csrf_token = jsessionid.strip('"') if jsessionid else None
         self.session = requests.Session()
         self._setup_session()
-        self._my_urn: str | None = None   # cached fsd_profile URN
+        self._my_urn: Optional[str] = None   # cached fsd_profile URN
 
     def _setup_session(self):
         self.session.headers.update({
@@ -111,7 +112,7 @@ class VoyagerClient:
     #  Auth check
     # ------------------------------------------------------------------ #
 
-    def get_me(self) -> dict | None:
+    def get_me(self) -> Optional[dict]:
         """GET /me — Check auth and return current user's miniProfile.
 
         Response shape:
@@ -145,7 +146,7 @@ class VoyagerClient:
         except (ValueError, KeyError):
             return None
 
-    def _get_my_urn(self) -> str | None:
+    def _get_my_urn(self) -> Optional[str]:
         """Return cached fsd_profile URN; resolve via get_me() if needed."""
         if not self._my_urn:
             self.get_me()
@@ -155,7 +156,7 @@ class VoyagerClient:
     #  Profile URN lookup (used by messaging)
     # ------------------------------------------------------------------ #
 
-    def get_profile_urn(self, slug: str) -> str | None:
+    def get_profile_urn(self, slug: str) -> Optional[str]:
         """
         Resolve a LinkedIn profile slug to a URN string like
         "urn:li:fsd_profile:ACoAAA...".
@@ -186,7 +187,7 @@ class VoyagerClient:
     #  Invite counts
     # ------------------------------------------------------------------ #
 
-    def get_invitation_counts(self) -> dict | None:
+    def get_invitation_counts(self) -> Optional[dict]:
         """GET /relationships/invitationsSummaryV2 — sent + pending counts."""
         self._throttle()
         url = f'{VOYAGER_BASE}/relationships/invitationsSummaryV2'
@@ -205,7 +206,7 @@ class VoyagerClient:
     #  Messaging — send
     # ------------------------------------------------------------------ #
 
-    def send_message(self, recipient_urn: str, message_text: str) -> dict | None:
+    def send_message(self, recipient_urn: str, message_text: str) -> Optional[dict]:
         """
         POST /voyagerMessagingDashMessengerMessages?action=createMessage
         Send a direct message to an existing connection.
@@ -419,7 +420,7 @@ class VoyagerClient:
     # ------------------------------------------------------------------ #
 
     def search_people(self, query: str = '', count: int = 20, start: int = 0,
-                      first_degree_only: bool = False, title: str | None = None) -> list:
+                      first_degree_only: bool = False, title: Optional[str] = None) -> list:
         """
         Search LinkedIn people.
 
