@@ -54,7 +54,11 @@ def existing_message_keys(conversation_urn: str) -> set:
 
 def upsert_messages(rows: list) -> dict:
     """
-    POST rows into global_messaging. Skips duplicates client-side.
+    POST rows into global_messaging with row-level upsert.
+
+    Uses `Prefer: resolution=ignore-duplicates` so existing rows
+    (matching the unique constraint on conversation_urn + message_date
+    + sender_name) are silently skipped instead of raising 409.
 
     Each row dict needs: conversation_urn, participant_name, participant_url,
                         sender_name, sender_is_me, message_text, message_date.
@@ -68,36 +72,22 @@ def upsert_messages(rows: list) -> dict:
         'apikey': key,
         'Authorization': f'Bearer {key}',
         'Content-Type': 'application/json',
-        'Prefer': 'return=minimal',
+        'Prefer': 'resolution=ignore-duplicates,return=minimal',
     }
-    # Group by conversation for efficient dedup lookup
-    by_conv = {}
-    for r in rows:
-        by_conv.setdefault(r['conversation_urn'], []).append(r)
-
     inserted = skipped = 0
     errors = []
-    for conv_urn, conv_rows in by_conv.items():
-        existing = existing_message_keys(conv_urn)
-        fresh = []
-        for r in conv_rows:
-            k = (r.get('message_date', '') or '', r.get('sender_name', '') or '',
-                 (r.get('message_text', '') or '')[:50])
-            if k in existing:
-                skipped += 1
-            else:
-                fresh.append(r)
-                existing.add(k)
-        if not fresh:
-            continue
+    # POST one at a time so a single conflict doesn't kill the whole batch
+    for r in rows:
         resp = requests.post(
             f'{url_root}/rest/v1/global_messaging',
-            headers=hdr, json=fresh,
+            headers=hdr, json=r,
         )
-        if resp.status_code in (200, 201, 204):
-            inserted += len(fresh)
+        if resp.status_code in (200, 201):
+            inserted += 1
+        elif resp.status_code == 409 or '23505' in resp.text:
+            skipped += 1
         else:
-            errors.append(f'  HTTP {resp.status_code}: {resp.text[:200]}')
+            errors.append(f'HTTP {resp.status_code}: {resp.text[:150]}')
     return {'inserted': inserted, 'skipped': skipped, 'errors': errors}
 
 
