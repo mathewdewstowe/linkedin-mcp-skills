@@ -7,6 +7,11 @@ description: LinkedIn skill — runs through the Voyager API for everything. Sea
 
 **Voyager-API-only. No UI clicks, no Chrome plugin at runtime.**
 
+## 🚨 Hard rule — message sync date cutoff
+**Never sync messages dated before 2026-04-20.** Always pass `--since 2026-04-20` on any `sync-messages` / `sync-thread` / message-history command. Pre-April-20 conversations and messages stay out of both the local SQLite DB and the Supabase `global_messaging` table.
+
+
+
 **Skill location:** `__REPO_DIR__/main.py`
 **Auth:** `~/.brave-paginator/profile` — already logged in. Headless Playwright, self-contained.
 
