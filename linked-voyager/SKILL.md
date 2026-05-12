@@ -61,6 +61,13 @@ Always wait ~5–8 seconds between consecutive runs (Playwright profile lock).
 | `conversations [count]` | Inbox conversations (default 20) with participant + last message. |
 | `messages <conversation_urn>` | Full message thread. |
 
+### Message sync (SQLite)
+| Command | What it does |
+|---|---|
+| `sync-messages [--full] [--limit N]` | Pull ALL messages from every conversation into SQLite at `~/Job Apply/linked-voyager.db`. Default = incremental (only new since last run). `--full` re-fetches everything. `--limit N` walks only first N conversations. Handles 20-message pagination automatically via `deliveredAt` cursor. |
+| `messages-stats` | DB summary: total conversations, total messages, top 20 contacts by message volume. |
+| `messages-with <slug_or_name> [limit]` | All messages exchanged with a person, chronological. |
+
 ### Messaging (write — Voyager API)
 | Command | What it does |
 |---|---|

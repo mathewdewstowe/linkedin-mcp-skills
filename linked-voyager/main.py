@@ -426,6 +426,65 @@ def main():
             if p['text']: print(f'    "{p["text"][:150]}..."')
             print()
 
+    elif command == 'sync-messages':
+        # sync-messages [--full] [--limit N]
+        args = sys.argv[2:]
+        full = '--full' in args
+        # how many conversations to walk (default all)
+        limit = None
+        for i, a in enumerate(args):
+            if a.startswith('--limit='):
+                limit = int(a.split('=', 1)[1])
+            elif a == '--limit' and i + 1 < len(args):
+                limit = int(args[i + 1])
+        import messages_store as MS
+        from browser import LinkedInBrowser
+        with LinkedInBrowser(headless=True) as br:
+            convs = br.voyager_get_conversations(count=200)
+            if limit:
+                convs = convs[:limit]
+            print(f'\n→ {len(convs)} conversations to sync\n')
+            total_new = 0
+            for idx, c in enumerate(convs, 1):
+                MS.upsert_conversation(c)
+                # Incremental sync unless --full
+                stop_at = 0 if full else MS.latest_message_timestamp(c['conversation_urn'])
+                msgs = br.voyager_get_messages_paginated(
+                    c['conversation_urn'],
+                    stop_at_timestamp=stop_at,
+                    max_pages=100,
+                )
+                added = MS.insert_messages(msgs)
+                total_new += added
+                status = '🟢' if added > 0 else '⚪'
+                print(f'  {status} [{idx}/{len(convs)}] {c["participant_name"]}: {len(msgs)} fetched, +{added} new')
+        print(f'\n✅ Sync complete — {total_new} new messages added')
+
+    elif command == 'messages-stats':
+        import messages_store as MS
+        s = MS.stats()
+        print(f'\n📊 LinkedIn message DB')
+        print(f'  DB:             {s["db_path"]}')
+        print(f'  Conversations:  {s["conversations"]}')
+        print(f'  Messages:       {s["messages"]}')
+        print(f'  Unique senders: {s["unique_senders"]}')
+        print(f'  Last message:   {s["last_message"]}')
+        print(f'\nTop 20 by message volume:')
+        for name, slug, n, last in s['top_by_volume']:
+            print(f'  {n:>5}  {name:<35}  last: {last or "-"}')
+
+    elif command == 'messages-with':
+        if len(sys.argv) < 3:
+            print('❌ Usage: messages-with <slug_or_name> [limit]'); return
+        target = sys.argv[2]
+        limit = int(sys.argv[3]) if len(sys.argv) > 3 else 200
+        import messages_store as MS
+        rows = MS.messages_with(target, limit=limit)
+        print(f'\n{len(rows)} messages with "{target}":\n')
+        for ts, sender, text in rows:
+            who = sender or 'me'
+            print(f'  [{ts}] {who}: {text[:200]}')
+
     elif command == 'recent-connections':
         # recent-connections [count] [--since-hours N] [--since-days N]
         args = sys.argv[2:]

@@ -831,6 +831,128 @@ class LinkedInBrowser:
 
     # ── Messages ──────────────────────────────────────────────────────── #
 
+    def voyager_search_conversation_by_name(self, name: str) -> Optional[dict]:
+        """
+        Search LinkedIn messaging for a conversation by person name.
+        Uses the messaging keywords search — completely separate from people search,
+        not rate-limited by the search API.
+
+        Returns dict with conversation_urn, last_message_text, last_message_at, participant_name
+        or None if no conversation found (never messaged).
+        """
+        from urllib.parse import quote as _quote
+        mailbox_urn = self._voyager_my_urn()
+        if not mailbox_urn:
+            return None
+
+        url = (
+            'https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql'
+            f'?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48'
+            f'&variables=(mailboxUrn:{self._venc(mailbox_urn)},keywords:{_quote(name, safe="")})'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return None
+
+        included = d.get('included', []) or []
+        message_map = {
+            i['entityUrn']: i
+            for i in included
+            if i.get('$type') == 'com.linkedin.messenger.Message' and i.get('entityUrn')
+        }
+        participant_map = {
+            i['entityUrn']: i
+            for i in included
+            if i.get('$type') == 'com.linkedin.messenger.MessagingParticipant' and i.get('entityUrn')
+        }
+        my_part_urn = f'urn:li:msg_messagingParticipant:{mailbox_urn}'
+
+        for conv in included:
+            if conv.get('$type') != 'com.linkedin.messenger.Conversation':
+                continue
+            conv_urn = conv.get('entityUrn', '')
+            last_at = conv.get('lastActivityAt', 0)
+
+            # Get participant name
+            p_name = ''
+            for ref in (conv.get('*conversationParticipants') or []):
+                if ref == my_part_urn:
+                    continue
+                p = participant_map.get(ref, {})
+                member = (p.get('participantType') or {}).get('member', {})
+                if member:
+                    first = (member.get('firstName') or {}).get('text', '')
+                    last_n = (member.get('lastName') or {}).get('text', '')
+                    p_name = f'{first} {last_n}'.strip()
+                    break
+
+            # Get last message snippet
+            snippet = ''
+            for mref in reversed((conv.get('messages') or {}).get('*elements', [])):
+                txt = (message_map.get(mref, {}).get('body') or {}).get('text', '')
+                if txt:
+                    snippet = txt[:300]
+                    break
+
+            import datetime as _dt
+            last_date = ''
+            if last_at:
+                try:
+                    last_date = _dt.datetime.fromtimestamp(last_at / 1000).strftime('%Y-%m-%d %H:%M')
+                except Exception:
+                    last_date = str(last_at)
+
+            return {
+                'conversation_urn':  conv_urn,
+                'participant_name':  p_name,
+                'last_message_text': snippet,
+                'last_message_at':   last_at,
+                'last_message_date': last_date,
+            }
+        return None
+
+    def voyager_get_conversation_with(self, fsd_urn: str) -> Optional[dict]:
+        """
+        Find the conversation with a specific person by their fsd_profile URN.
+        Uses the participants query endpoint — works regardless of how old the thread is.
+
+        Returns the conversation dict (same shape as voyager_get_conversations)
+        or None if no conversation exists.
+        """
+        import re as _re
+        url = (
+            'https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql'
+            f'?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48'
+            f'&variables=(recipients:List({self._venc(fsd_urn)}))'
+        )
+        d = self._voyager_fetch(url)
+        if not d:
+            return None
+
+        included = d.get('included', [])
+        message_map = {
+            i['entityUrn']: i
+            for i in included
+            if i.get('$type') == 'com.linkedin.messenger.Message' and i.get('entityUrn')
+        }
+
+        for conv in included:
+            if conv.get('$type') != 'com.linkedin.messenger.Conversation':
+                continue
+            conv_urn = conv.get('entityUrn', '')
+            snippet = ''
+            for mref in reversed((conv.get('messages') or {}).get('*elements', [])):
+                txt = (message_map.get(mref, {}).get('body') or {}).get('text', '')
+                if txt:
+                    snippet = txt[:300]
+                    break
+            return {
+                'conversation_urn':  conv_urn,
+                'last_message_text': snippet,
+                'last_message_at':   conv.get('lastActivityAt', 0),
+            }
+        return None
+
     def voyager_get_messages(self, conversation_urn: str) -> list:
         """
         GET messengerMessages via browser.
@@ -1183,14 +1305,17 @@ class LinkedInBrowser:
         if not query:
             query = slug
 
-        # Search 1st-degree only — avoids matching wrong person with same name
-        people = self.voyager_search_people(query, count=10, first_degree_only=True)
-        # Prefer exact slug match, then first result
+        # Search without 1st-degree filter for broader coverage, but require exact slug match
+        people = self.voyager_search_people(query, count=20, first_degree_only=False)
+        # Exact slug match only — prevents wrong-person sends
         match = next((p for p in people if p.get('slug', '').lower() == slug.lower()), None)
-        if not match and people:
-            match = people[0]
         if match:
             m = _re.search(r'(urn:li:fsd_profile:[^,)]+)', match.get('urn', ''))
+            return m.group(1) if m else ''
+        # Last resort: 1st-degree search, accept first result only if unique
+        people_1st = self.voyager_search_people(query, count=5, first_degree_only=True)
+        if len(people_1st) == 1:
+            m = _re.search(r'(urn:li:fsd_profile:[^,)]+)', people_1st[0].get('urn', ''))
             return m.group(1) if m else ''
         return ''
 
@@ -1763,6 +1888,110 @@ class LinkedInBrowser:
             if len(posts) >= count:
                 break
         return posts
+
+    # ── Messages pagination (for full sync) ──────────────────────────── #
+
+    def voyager_get_messages_paginated(self, conversation_urn: str,
+                                       max_pages: int = 100,
+                                       stop_at_timestamp: int = 0,
+                                       sleep_ms: int = 250) -> list:
+        """
+        Fetch ALL messages in a conversation by paginating with deliveredAt cursor.
+
+        Args:
+          conversation_urn: full URN
+          max_pages: safety cap (default 100 pages × 20 msgs = 2000 max)
+          stop_at_timestamp: stop once we hit a message older than this ms epoch
+                             (use for incremental sync — pass last_synced_at)
+          sleep_ms: throttle between page requests
+
+        Returns: list of message dicts (oldest → newest), each with
+                 message_urn, sender_name, sender_url, sender_slug, text,
+                 sent_at, conversation_urn.
+        """
+        import time as _time
+        all_msgs = []
+        seen_urns = set()
+        cursor = 0  # deliveredAt cursor (0 = newest first)
+
+        for page in range(max_pages):
+            # Build URL with optional deliveredAt cursor
+            base = (
+                'https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql'
+                f'?queryId=messengerMessages.5846eeb71c981f11e0134cb6626cc314'
+            )
+            if cursor:
+                vars_str = f'(conversationUrn:{self._venc(conversation_urn)},deliveredAt:{cursor})'
+            else:
+                vars_str = f'(conversationUrn:{self._venc(conversation_urn)})'
+            url = f'{base}&variables={vars_str}'
+
+            d = self._voyager_fetch(url)
+            if not d:
+                break
+
+            included = d.get('included', [])
+            participants = {
+                i['entityUrn']: i for i in included
+                if i.get('$type') == 'com.linkedin.messenger.MessagingParticipant'
+                and i.get('entityUrn')
+            }
+
+            page_msgs = []
+            for item in included:
+                if item.get('$type') != 'com.linkedin.messenger.Message':
+                    continue
+                urn = item.get('entityUrn', '')
+                if not urn or urn in seen_urns:
+                    continue
+                seen_urns.add(urn)
+
+                text = (item.get('body') or {}).get('text', '') or ''
+                sent_at = item.get('deliveredAt', 0)
+
+                sender_name = sender_slug = sender_url = ''
+                sref = item.get('*sender') or ''
+                if sref:
+                    p = participants.get(sref, {})
+                    mem = (p.get('participantType') or {}).get('member', {})
+                    first = (mem.get('firstName') or {}).get('text', '')
+                    last_n = (mem.get('lastName') or {}).get('text', '')
+                    sender_name = f'{first} {last_n}'.strip()
+                    raw = mem.get('profileUrl', '') or ''
+                    sender_url = raw.split('?')[0] if raw else ''
+                    sender_slug = sender_url.rstrip('/').split('/')[-1]
+
+                page_msgs.append({
+                    'message_urn':      urn,
+                    'conversation_urn': conversation_urn,
+                    'sender_name':      sender_name,
+                    'sender_slug':      sender_slug,
+                    'sender_url':       sender_url,
+                    'text':             text,
+                    'sent_at':          sent_at,
+                })
+
+            if not page_msgs:
+                break
+
+            page_msgs.sort(key=lambda m: m['sent_at'], reverse=True)
+            all_msgs.extend(page_msgs)
+
+            # Stop conditions
+            oldest = page_msgs[-1]['sent_at']
+            if stop_at_timestamp and oldest <= stop_at_timestamp:
+                break
+            if len(page_msgs) < 5:  # under typical page size → end of thread
+                break
+
+            # Next page: anything older than the oldest we just got
+            cursor = oldest
+            if sleep_ms:
+                _time.sleep(sleep_ms / 1000.0)
+
+        # Final sort oldest → newest
+        all_msgs.sort(key=lambda m: m['sent_at'])
+        return all_msgs
 
     # ── Connections ───────────────────────────────────────────────────── #
 
