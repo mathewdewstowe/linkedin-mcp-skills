@@ -458,12 +458,13 @@ def main():
             _conn.close()
             print(f'  [existing-only] {len(existing_urns)} known conversations in DB')
         with LinkedInBrowser(headless=True) as br:
-            # Paginate the inbox — get every conversation (not just first 20)
-            print('  [fetch] paginating inbox...')
-            convs = br.voyager_get_all_conversations(
-                max_pages=50,
-                stop_at_timestamp=since_ts,  # don't fetch convos older than --since
-            )
+            # Paginate the FULL inbox — never stop early on date.
+            # Per-thread message filtering (via stop_at_timestamp on messages,
+            # not conversations) handles --since correctly. Stopping conversation
+            # pagination early can miss threads where lastActivityAt is missing
+            # or out-of-order (LinkedIn doesn't always sort strictly DESC).
+            print('  [fetch] paginating inbox (full walk)...')
+            convs = br.voyager_get_all_conversations(max_pages=100)
             print(f'  [fetch] {len(convs)} conversations retrieved across pages')
             if limit:
                 convs = convs[:limit]

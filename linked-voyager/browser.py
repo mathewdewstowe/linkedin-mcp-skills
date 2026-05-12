@@ -2226,9 +2226,12 @@ class LinkedInBrowser:
                 sref = item.get('*sender') or ''
                 if sref:
                     p = participants.get(sref, {})
-                    mem = (p.get('participantType') or {}).get('member', {})
-                    first = (mem.get('firstName') or {}).get('text', '')
-                    last_n = (mem.get('lastName') or {}).get('text', '')
+                    # Defensive: participantType / member can be None for
+                    # system messages, removed users, "LinkedIn Member"
+                    # placeholders, etc.
+                    mem = ((p.get('participantType') or {}).get('member') or {})
+                    first = ((mem.get('firstName') or {}).get('text', '') or '')
+                    last_n = ((mem.get('lastName') or {}).get('text', '') or '')
                     sender_name = f'{first} {last_n}'.strip()
                     raw = mem.get('profileUrl', '') or ''
                     sender_url = raw.split('?')[0] if raw else ''
