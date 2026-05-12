@@ -457,7 +457,13 @@ def main():
             _conn.close()
             print(f'  [existing-only] {len(existing_urns)} known conversations in DB')
         with LinkedInBrowser(headless=True) as br:
-            convs = br.voyager_get_conversations(count=200)
+            # Paginate the inbox — get every conversation (not just first 20)
+            print('  [fetch] paginating inbox...')
+            convs = br.voyager_get_all_conversations(
+                max_pages=50,
+                stop_at_timestamp=since_ts,  # don't fetch convos older than --since
+            )
+            print(f'  [fetch] {len(convs)} conversations retrieved across pages')
             if limit:
                 convs = convs[:limit]
             if existing_only:
@@ -501,6 +507,85 @@ def main():
         print(f'\nTop 20 by message volume:')
         for name, slug, n, last in s['top_by_volume']:
             print(f'  {n:>5}  {name:<35}  last: {last or "-"}')
+
+    elif command == 'sync-thread':
+        # sync-thread <thread_url_or_id> [participant_name]
+        # Accepts:
+        #   https://www.linkedin.com/messaging/thread/2-Xxxxx==/
+        #   2-Xxxxx==
+        #   urn:li:msg_conversation:(urn:li:fsd_profile:HASH,2-Xxxxx==)
+        if len(sys.argv) < 3:
+            print('❌ Usage: sync-thread <thread_url_or_id_or_urn> [participant_name]')
+            return
+        raw = sys.argv[2]
+        name = sys.argv[3] if len(sys.argv) > 3 else ''
+        import re as _re, messages_store as MS
+        from browser import LinkedInBrowser
+        # Already a full conversation URN?
+        if raw.startswith('urn:li:msg_conversation:'):
+            conv_urn = raw
+        else:
+            # Extract thread_id from a /messaging/thread/X/ URL or raw token
+            m = _re.search(r'/messaging/thread/([^/?#]+)', raw)
+            thread_id = m.group(1) if m else raw.strip('/').split('/')[-1]
+            with LinkedInBrowser(headless=True) as br_tmp:
+                mailbox = br_tmp._voyager_my_urn()
+            conv_urn = f'urn:li:msg_conversation:({mailbox},{thread_id})'
+        print(f'  Conversation URN: {conv_urn}')
+        with LinkedInBrowser(headless=True) as br:
+            msgs = br.voyager_get_messages_paginated(conv_urn, max_pages=100)
+            if not msgs:
+                print(f'❌ No messages returned (URN may be invalid or no thread exists)')
+                return
+            # Derive participant name from the messages if not provided
+            if not name:
+                # Find a non-me sender
+                ME = br._voyager_my_urn().split(':')[-1]
+                for m in msgs:
+                    if m.get('sender_slug') and m['sender_slug'] != ME:
+                        name = m.get('sender_name', '')
+                        break
+            MS.upsert_conversation({
+                'conversation_urn': conv_urn,
+                'participant_name': name or '(unknown)',
+                'participant_url':  '',
+                'last_message_text':'',
+                'last_message_at':  msgs[-1]['sent_at'],
+                'unread_count':     0,
+            })
+            added = MS.insert_messages(msgs)
+        print(f'✅ {name or conv_urn}: {len(msgs)} fetched, +{added} new in DB')
+
+    elif command == 'sync-messages-with':
+        # sync-messages-with <slug_or_profile_url>
+        if len(sys.argv) < 3:
+            print('❌ Usage: sync-messages-with <slug_or_profile_url>')
+            return
+        slug = sys.argv[2].rstrip('/').split('/')[-1].split('?')[0]
+        import messages_store as MS
+        from browser import LinkedInBrowser
+        with LinkedInBrowser(headless=True) as br:
+            r = br.voyager_find_conversation_with(slug)
+            if r.get('error'):
+                print(f'❌ {r["error"]}'); return
+            if r.get('is_new'):
+                print(f'⚠ No existing conversation with {slug} (LinkedIn opened compose for new thread)')
+                return
+            conv_urn = r['conversation_urn']
+            print(f'✓ Found conversation: {conv_urn}')
+            # Pull all messages
+            msgs = br.voyager_get_messages_paginated(conv_urn, max_pages=100)
+            # Upsert conversation row (use slug for participant_name fallback)
+            MS.upsert_conversation({
+                'conversation_urn': conv_urn,
+                'participant_name': slug.replace('-', ' ').title(),
+                'participant_url':  f'https://www.linkedin.com/in/{slug}/',
+                'last_message_text':'',
+                'last_message_at':  msgs[-1]['sent_at'] if msgs else 0,
+                'unread_count':     0,
+            })
+            added = MS.insert_messages(msgs)
+        print(f'✅ {slug}: {len(msgs)} fetched, +{added} new in DB')
 
     elif command == 'messages-with':
         if len(sys.argv) < 3:
