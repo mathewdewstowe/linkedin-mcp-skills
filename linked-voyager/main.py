@@ -427,33 +427,62 @@ def main():
             print()
 
     elif command == 'sync-messages':
-        # sync-messages [--full] [--limit N]
+        # sync-messages [--full] [--limit N] [--since YYYY-MM-DD] [--existing-only]
         args = sys.argv[2:]
         full = '--full' in args
-        # how many conversations to walk (default all)
+        existing_only = '--existing-only' in args
         limit = None
+        since_date = None
         for i, a in enumerate(args):
             if a.startswith('--limit='):
                 limit = int(a.split('=', 1)[1])
             elif a == '--limit' and i + 1 < len(args):
                 limit = int(args[i + 1])
+            elif a.startswith('--since='):
+                since_date = a.split('=', 1)[1]
+            elif a == '--since' and i + 1 < len(args):
+                since_date = args[i + 1]
+        # Convert --since YYYY-MM-DD to ms epoch
+        since_ts = 0
+        if since_date:
+            from datetime import datetime as _dt
+            since_ts = int(_dt.strptime(since_date, '%Y-%m-%d').timestamp() * 1000)
         import messages_store as MS
         from browser import LinkedInBrowser
+        import sqlite3, os as _os
+        existing_urns = set()
+        if existing_only:
+            _conn = sqlite3.connect(_os.path.expanduser('~/Job Apply/linked-voyager.db'))
+            existing_urns = {r[0] for r in _conn.execute('SELECT conversation_urn FROM msg_conversations').fetchall()}
+            _conn.close()
+            print(f'  [existing-only] {len(existing_urns)} known conversations in DB')
         with LinkedInBrowser(headless=True) as br:
             convs = br.voyager_get_conversations(count=200)
             if limit:
                 convs = convs[:limit]
-            print(f'\n→ {len(convs)} conversations to sync\n')
+            if existing_only:
+                convs = [c for c in convs if c['conversation_urn'] in existing_urns]
+            print(f'\n→ {len(convs)} conversations to sync' +
+                  (f' (since {since_date})' if since_date else '') + '\n')
             total_new = 0
             for idx, c in enumerate(convs, 1):
                 MS.upsert_conversation(c)
-                # Incremental sync unless --full
-                stop_at = 0 if full else MS.latest_message_timestamp(c['conversation_urn'])
+                # Decide stop cutoff
+                if full:
+                    stop_at = 0
+                elif since_ts:
+                    # Use max(since_ts, last_synced) so we don't double-fetch
+                    stop_at = max(since_ts, MS.latest_message_timestamp(c['conversation_urn']))
+                else:
+                    stop_at = MS.latest_message_timestamp(c['conversation_urn'])
                 msgs = br.voyager_get_messages_paginated(
                     c['conversation_urn'],
                     stop_at_timestamp=stop_at,
                     max_pages=100,
                 )
+                # If --since set, hard-filter messages older than the cutoff
+                if since_ts:
+                    msgs = [m for m in msgs if m['sent_at'] >= since_ts]
                 added = MS.insert_messages(msgs)
                 total_new += added
                 status = '🟢' if added > 0 else '⚪'
