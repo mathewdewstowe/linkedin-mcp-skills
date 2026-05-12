@@ -496,11 +496,16 @@ def main():
                 # Also push to Supabase if requested
                 if use_supabase and msgs:
                     import supabase_sync as SS
+                    from datetime import datetime, timezone
                     my_urn = br._voyager_my_urn()
                     my_slug = my_urn.split(':')[-1]
                     sb_rows = []
                     for m in msgs:
                         is_me = (m.get('sender_slug') == my_slug)
+                        # Always use UTC ISO format (no tz suffix) for consistent dedup
+                        sa = m.get('sent_at', 0)
+                        msg_date = (datetime.fromtimestamp(sa/1000, tz=timezone.utc)
+                                    .replace(tzinfo=None).isoformat()) if sa else None
                         sb_rows.append({
                             'conversation_urn':   m['conversation_urn'],
                             'participant_name':   c.get('participant_name', ''),
@@ -508,8 +513,7 @@ def main():
                             'sender_name':        m.get('sender_name', '') or 'me',
                             'sender_is_me':       is_me,
                             'message_text':       m.get('text', ''),
-                            'message_date':       m.get('sent_at_iso') or
-                                                  (__import__('datetime').datetime.utcfromtimestamp(m.get('sent_at',0)/1000).isoformat() if m.get('sent_at') else None),
+                            'message_date':       msg_date,
                         })
                     res = SS.upsert_messages(sb_rows)
                     sb_added = res['inserted']
