@@ -749,61 +749,94 @@ class LinkedInBrowser:
 
     # ── Conversations ─────────────────────────────────────────────────── #
 
-    def voyager_get_all_conversations(self, max_pages: int = 50,
+    def voyager_get_all_conversations(self, max_pages: int = 100,
                                       stop_at_timestamp: int = 0,
-                                      sleep_ms: int = 250) -> list:
+                                      sleep_ms: int = 250,
+                                      category: str = 'INBOX') -> list:
         """
-        Walk every page of the inbox by paginating with lastUpdatedBefore.
+        Walk every page of the inbox via cursor-based pagination.
+
+        Uses the messengerConversations.9501074288a12f3ae9e3c7ea243bccbf
+        queryId (the one LinkedIn's own web UI uses for infinite scroll),
+        which returns a `metadata.nextCursor` token used to fetch the
+        next page.
 
         Args:
-          max_pages: safety cap (50 pages × 20 = 1000 conversations)
+          max_pages: safety cap (100 pages × 20 = 2000 conversations)
           stop_at_timestamp: stop once we hit conversations older than this ms epoch
           sleep_ms: throttle between page requests
+          category: INBOX | ARCHIVE | OTHER (matches LinkedIn UI tabs)
 
         Returns combined list of conversation dicts.
         """
         import time as _time
         all_convos = []
         seen_urns = set()
-        cursor = 0  # lastUpdatedBefore (0 = newest first)
+        cursor = None  # None = first page
 
         for page in range(max_pages):
-            convs = self._voyager_get_conversations_page(cursor=cursor)
+            convs, next_cursor = self._voyager_get_conversations_page(
+                cursor=cursor, category=category
+            )
             if not convs:
                 break
             new = [c for c in convs if c['conversation_urn'] not in seen_urns]
-            if not new:
-                break
             for c in new:
                 seen_urns.add(c['conversation_urn'])
                 all_convos.append(c)
-            oldest = min(c['last_message_at'] for c in new if c['last_message_at']) \
-                     if new else 0
-            if stop_at_timestamp and oldest and oldest <= stop_at_timestamp:
+            if not new:
                 break
-            if not oldest:
+            # Optional time-based stop
+            if stop_at_timestamp:
+                oldest = min(c['last_message_at'] for c in new if c['last_message_at']) \
+                         if any(c['last_message_at'] for c in new) else 0
+                if oldest and oldest <= stop_at_timestamp:
+                    break
+            # Stop if LinkedIn didn't return a next cursor
+            if not next_cursor or next_cursor == cursor:
                 break
-            cursor = oldest
+            cursor = next_cursor
             if sleep_ms:
                 _time.sleep(sleep_ms / 1000.0)
         return all_convos
 
-    def _voyager_get_conversations_page(self, cursor: int = 0) -> list:
-        """Fetch one page (20 conversations) optionally with lastUpdatedBefore cursor."""
+    def _voyager_get_conversations_page(self, cursor: str = None,
+                                        category: str = 'INBOX') -> tuple:
+        """
+        Fetch one page (20 conversations) using the paginated queryId.
+
+        Returns (list_of_conversations, next_cursor) tuple.
+        """
         mailbox_urn = self._voyager_my_urn()
         if not mailbox_urn:
-            return []
+            return [], None
+        # Pagination queryId (different from the non-paginating one)
+        qid = 'messengerConversations.9501074288a12f3ae9e3c7ea243bccbf'
+        base_vars = (
+            f'(query:(predicateUnions:List((conversationCategoryPredicate:'
+            f'(category:{category})))),count:20,mailboxUrn:{self._venc(mailbox_urn)}'
+        )
         if cursor:
-            vars_str = f'(mailboxUrn:{self._venc(mailbox_urn)},lastUpdatedBefore:{cursor})'
-        else:
-            vars_str = f'(mailboxUrn:{self._venc(mailbox_urn)})'
+            base_vars += f',nextCursor:{self._venc(cursor)}'
+        base_vars += ')'
         url = (
             'https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql'
-            f'?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48'
-            f'&variables={vars_str}'
+            f'?queryId={qid}&variables={base_vars}'
         )
         d = self._voyager_fetch(url)
-        return self._parse_conversations(d) if d else []
+        if not d:
+            return [], None
+        # Parse conversations from included[]
+        convs = self._parse_conversations(d)
+        # Pull next cursor from response metadata
+        next_cursor = None
+        try:
+            next_cursor = (d.get('data', {}).get('data', {})
+                           .get('messengerConversationsByCategoryQuery', {})
+                           .get('metadata', {}).get('nextCursor'))
+        except Exception:
+            pass
+        return convs, next_cursor
 
     def _parse_conversations(self, d: dict) -> list:
         """Extract conversation dicts from a messengerConversations response."""
@@ -1026,43 +1059,73 @@ class LinkedInBrowser:
     def voyager_get_conversation_with(self, fsd_urn: str) -> Optional[dict]:
         """
         Find the conversation with a specific person by their fsd_profile URN.
-        Uses the participants query endpoint — works regardless of how old the thread is.
+        Paginates through the inbox and matches by participant URN.
 
-        Returns the conversation dict (same shape as voyager_get_conversations)
+        Returns: { conversation_urn, last_message_text, last_message_at }
         or None if no conversation exists.
         """
-        import re as _re
-        url = (
-            'https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql'
-            f'?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48'
-            f'&variables=(recipients:List({self._venc(fsd_urn)}))'
-        )
-        d = self._voyager_fetch(url)
-        if not d:
+        import time as _time
+        mailbox = self._voyager_my_urn()
+        if not mailbox:
             return None
 
-        included = d.get('included', [])
-        message_map = {
-            i['entityUrn']: i
-            for i in included
-            if i.get('$type') == 'com.linkedin.messenger.Message' and i.get('entityUrn')
-        }
+        # fsd_urn appears inside the MessagingParticipant URN
+        # e.g. urn:li:msg_messagingParticipant:urn:li:fsd_profile:HASH
+        cursor = 0
+        for _page in range(20):  # up to 20 pages × 20 convs = 400 conversations
+            if cursor:
+                variables = f'(mailboxUrn:{self._venc(mailbox)},lastUpdatedBefore:{cursor})'
+            else:
+                variables = f'(mailboxUrn:{self._venc(mailbox)})'
 
-        for conv in included:
-            if conv.get('$type') != 'com.linkedin.messenger.Conversation':
-                continue
-            conv_urn = conv.get('entityUrn', '')
-            snippet = ''
-            for mref in reversed((conv.get('messages') or {}).get('*elements', [])):
-                txt = (message_map.get(mref, {}).get('body') or {}).get('text', '')
-                if txt:
-                    snippet = txt[:300]
-                    break
-            return {
-                'conversation_urn':  conv_urn,
-                'last_message_text': snippet,
-                'last_message_at':   conv.get('lastActivityAt', 0),
+            url = (
+                'https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql'
+                f'?queryId=messengerConversations.0d5e6781bbee71c3e51c8843c6519f48'
+                f'&variables={variables}'
+            )
+            d = self._voyager_fetch(url)
+            if not d:
+                break
+
+            included = d.get('included', [])
+            participant_map = {
+                i['entityUrn']: i for i in included
+                if i.get('$type') == 'com.linkedin.messenger.MessagingParticipant'
             }
+            message_map = {
+                i['entityUrn']: i for i in included
+                if i.get('$type') == 'com.linkedin.messenger.Message'
+            }
+
+            conversations = [i for i in included
+                             if i.get('$type') == 'com.linkedin.messenger.Conversation']
+            if not conversations:
+                break
+
+            for conv in conversations:
+                for p_ref in (conv.get('*conversationParticipants') or []):
+                    # MessagingParticipant URN contains the fsd_profile URN as a substring
+                    if fsd_urn in p_ref:
+                        conv_urn = conv.get('entityUrn', '')
+                        snippet = ''
+                        for mref in reversed((conv.get('messages') or {}).get('*elements', [])):
+                            txt = (message_map.get(mref, {}).get('body') or {}).get('text', '')
+                            if txt:
+                                snippet = txt[:300]
+                                break
+                        return {
+                            'conversation_urn':  conv_urn,
+                            'last_message_text': snippet,
+                            'last_message_at':   conv.get('lastActivityAt', 0),
+                        }
+
+            # Advance cursor to oldest conversation's lastActivityAt
+            oldest = min((c.get('lastActivityAt', 0) or 0) for c in conversations)
+            if not oldest or oldest == cursor:
+                break
+            cursor = oldest
+            _time.sleep(0.2)
+
         return None
 
     def voyager_get_messages(self, conversation_urn: str) -> list:
@@ -1378,56 +1441,48 @@ class LinkedInBrowser:
     def voyager_resolve_slug_to_urn(self, slug: str) -> str:
         """
         Resolve a LinkedIn public profile slug to an fsd_profile URN.
-        Strategy:
-          1. Try direct profile API (works for many slugs)
-          2. Fall back to people search — strip numeric suffix, search by name,
-             match exact slug or best-guess first result
+        Uses voyagerIdentityDashProfiles (the working endpoint).
+        Falls back to people search only if needed.
         Returns 'urn:li:fsd_profile:...' or '' on failure.
         """
         import re as _re
 
-        def _extract_urn(data):
+        def _find_fsd_urn(data) -> str:
             if not data:
                 return ''
-            entity_urn = data.get('entityUrn', '')
-            if entity_urn and 'fsd_profile' in entity_urn:
-                return entity_urn
-            for item in (data.get('included', []) or []):
-                urn = item.get('entityUrn', '')
-                if urn and 'fsd_profile' in urn:
-                    return urn
-            mini = data.get('miniProfile', {}) or {}
-            obj_urn = mini.get('objectUrn', '')
-            if obj_urn and 'fs_miniProfile' in obj_urn:
-                return obj_urn.replace('fs_miniProfile:', 'fsd_profile:')
-            return ''
+            raw = str(data)
+            m = _re.search(r'urn:li:fsd_profile:[A-Za-z0-9_\-]+', raw)
+            return m.group(0) if m else ''
 
-        # 1. Direct profile API
-        url = f'https://www.linkedin.com/voyager/api/identity/profiles/{slug}'
-        data = self._voyager_fetch(url)
-        urn = _extract_urn(data)
+        # Strip trailing hex/numeric disambiguation suffix (e.g. mark-scott-bb854025 → mark-scott)
+        clean_slug = _re.sub(r'-[0-9a-f]{6,}$', '', slug, flags=_re.IGNORECASE)
+        clean_slug = _re.sub(r'-\d{5,}$', '', clean_slug) or slug
+
+        # 1. voyagerIdentityDashProfiles — the reliable endpoint (try clean slug first, then full)
+        for s in ([clean_slug, slug] if clean_slug != slug else [slug]):
+            url = (f'https://www.linkedin.com/voyager/api/voyagerIdentityDashProfiles'
+                   f'?q=memberIdentity&memberIdentity={s}')
+            data = self._voyager_fetch(url)
+            urn = _find_fsd_urn(data)
+            if urn:
+                return urn
+
+        # 2. Legacy direct profile API (sometimes works)
+        data2 = self._voyager_fetch(
+            f'https://www.linkedin.com/voyager/api/identity/profiles/{slug}')
+        urn = _find_fsd_urn(data2)
         if urn:
             return urn
 
-        # 2. Search fallback — strip trailing hex/numeric suffix for query
+        # 3. Search fallback (rate-limited — last resort)
+        import re as _re
         name_part = _re.sub(r'-[0-9a-f]{6,}$', '', slug, flags=_re.IGNORECASE)
-        # Also strip pure-numeric suffix (e.g. -123456)
         name_part = _re.sub(r'-\d{5,}$', '', name_part)
-        query = name_part.replace('-', ' ').strip()
-        if not query:
-            query = slug
-
-        # Search without 1st-degree filter for broader coverage, but require exact slug match
+        query = name_part.replace('-', ' ').strip() or slug
         people = self.voyager_search_people(query, count=20, first_degree_only=False)
-        # Exact slug match only — prevents wrong-person sends
         match = next((p for p in people if p.get('slug', '').lower() == slug.lower()), None)
         if match:
             m = _re.search(r'(urn:li:fsd_profile:[^,)]+)', match.get('urn', ''))
-            return m.group(1) if m else ''
-        # Last resort: 1st-degree search, accept first result only if unique
-        people_1st = self.voyager_search_people(query, count=5, first_degree_only=True)
-        if len(people_1st) == 1:
-            m = _re.search(r'(urn:li:fsd_profile:[^,)]+)', people_1st[0].get('urn', ''))
             return m.group(1) if m else ''
         return ''
 
@@ -2006,20 +2061,35 @@ class LinkedInBrowser:
     def voyager_find_conversation_with(self, profile_slug: str) -> dict:
         """
         Open the contact's profile, click Message, and capture the resulting
-        conversation URN from the URL.
+        conversation URN — works whether LinkedIn navigates or opens a drawer.
 
         Returns: {
           'conversation_urn': 'urn:li:msg_conversation:(...)',
           'thread_id':        'base64_thread_id',
-          'is_new':           bool,    # True if /thread/new/ — no existing thread
+          'is_new':           bool,    # True if no existing thread
           'recipient_hash':   'ACoA...'
         }
         """
+        import re as _re
+
         page = self._context.new_page()
+        captured = {}
+
+        def _on_request(req):
+            url = req.url
+            # Capture any messaging conversation load
+            if 'voyagerMessagingGraphQL' in url or 'messengerConversations' in url:
+                m = _re.search(r'conversationUrn=([^&%]+)', url)
+                if m and not captured.get('conv_urn'):
+                    captured['conv_urn'] = m.group(1)
+
+        page.on('request', _on_request)
+
         try:
             page.goto(f'https://www.linkedin.com/in/{profile_slug}/',
-                      wait_until='domcontentloaded', timeout=20000)
-            page.wait_for_timeout(2500)
+                      wait_until='domcontentloaded', timeout=25000)
+            page.wait_for_timeout(3000)
+
             # Click Message via JS (SDUI button)
             clicked = page.evaluate('''() => {
                 const btns = Array.from(document.querySelectorAll("button, a"));
@@ -2029,24 +2099,59 @@ class LinkedInBrowser:
             }''')
             if not clicked:
                 return {'error': 'no Message button on profile'}
-            # Wait for URL to settle on a /messaging/thread/X/ URL
-            page.wait_for_url('**/messaging/thread/**', timeout=10000)
+
+            # Wait up to 8s for either a URL nav or drawer to settle
+            page.wait_for_timeout(4000)
             url = page.url
-            # Parse thread_id from URL
-            import re as _re
+
+            # Case 1: URL navigated to /messaging/thread/XXX
+            thread_id = ''
             m = _re.search(r'/messaging/thread/([^/?#]+)', url)
-            thread_id = m.group(1) if m else ''
-            # Detect new vs existing
-            is_new = thread_id == 'new'
+            if m:
+                thread_id = m.group(1)
+
+            # Case 2: URL didn't navigate — check for conversation URN in intercepted requests
+            if not thread_id and captured.get('conv_urn'):
+                raw_urn = captured['conv_urn']
+                # Extract thread_id from URN like urn:li:msg_conversation:(urn:li:fsd_profile:HASH,THREAD)
+                tm = _re.search(r',([^)]+)\)$', raw_urn)
+                if tm:
+                    thread_id = tm.group(1)
+
+            # Case 3: Check DOM for a conversation link or data attribute
+            if not thread_id:
+                thread_id = page.evaluate('''() => {
+                    // Check if a messaging panel opened — look for conversation links
+                    const links = Array.from(document.querySelectorAll('a[href*="/messaging/thread/"]'));
+                    if (links.length) {
+                        const m = links[0].href.match(/\\/messaging\\/thread\\/([^/?#]+)/);
+                        return m ? m[1] : '';
+                    }
+                    return '';
+                }''') or ''
+
+            # Determine is_new
+            is_new = not bool(thread_id) or thread_id == 'new'
             recipient_hash = ''
+            conversation_urn = ''
+
             if is_new:
                 rm = _re.search(r'recipient=([^&]+)', url)
                 if rm:
                     recipient_hash = rm.group(1)
-                conversation_urn = ''
+                # Also try from DOM
+                if not recipient_hash:
+                    recipient_hash = page.evaluate('''() => {
+                        const u = new URL(window.location.href);
+                        return u.searchParams.get("recipient") || "";
+                    }''') or ''
             else:
                 mailbox = self._voyager_my_urn()
                 conversation_urn = f'urn:li:msg_conversation:({mailbox},{thread_id})'
+                # Override with captured full URN if available
+                if captured.get('conv_urn') and 'msg_conversation' in captured['conv_urn']:
+                    conversation_urn = captured['conv_urn']
+
             return {
                 'conversation_urn': conversation_urn,
                 'thread_id':        thread_id,

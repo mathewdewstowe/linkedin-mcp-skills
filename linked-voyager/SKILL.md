@@ -64,7 +64,7 @@ Always wait ~5–8 seconds between consecutive runs (Playwright profile lock).
 ### Message sync (SQLite)
 | Command | What it does |
 |---|---|
-| `sync-messages [--full] [--limit N]` | Pull ALL messages from every conversation into SQLite at `~/Job Apply/linked-voyager.db`. Default = incremental (only new since last run). `--full` re-fetches everything. `--limit N` walks only first N conversations. Handles 20-message pagination automatically via `deliveredAt` cursor. |
+| `sync-messages [--full] [--limit N] [--since YYYY-MM-DD] [--existing-only]` | Pull ALL messages from every conversation into SQLite at `~/Job Apply/linked-voyager.db`. **Now walks the entire inbox** via the cursor-based pagination queryId (`messengerConversations.9501074288a12f3ae9e3c7ea243bccbf`) — no longer capped at 20 conversations. Default = incremental (only new since last run). `--full` re-fetches everything. `--limit N` caps how many conversations to walk. Per-thread message history uses `deliveredAt` cursor. |
 | `messages-stats` | DB summary: total conversations, total messages, top 20 contacts by message volume. |
 | `messages-with <slug_or_name> [limit]` | All messages exchanged with a person, chronological. |
 
@@ -144,6 +144,21 @@ Note the wrapper `(query:(...))` — top-level keywords without this wrapper ret
 
 ### Profile posts — `/voyager/api/identity/profileUpdatesV2?profileUrn=URN&q=memberShareFeed`
 Posts in `included[]` as `com.linkedin.voyager.feed.render.UpdateV2`. SocialActivityCounts also in `included[]`, lookup by entityUrn.
+
+### Inbox pagination — paginated `messengerConversations` queryId
+LinkedIn has TWO `messengerConversations` queryIds:
+- `0d5e6781bbee71c3e51c8843c6519f48` — non-paginating, caps at 20 (avoid)
+- `9501074288a12f3ae9e3c7ea243bccbf` — paginating, returns `metadata.nextCursor`
+
+Variables for paginated version:
+```
+(query:(predicateUnions:List((conversationCategoryPredicate:(category:INBOX)))),
+ count:20,
+ mailboxUrn:URN,
+ nextCursor:CURSOR)   <-- optional; omit on first page
+```
+
+The cursor is base64 of `DESCENDING&TIMESTAMP&LAST_THREAD_ID`. Pass it back as `nextCursor:VALUE` (URL-encoded) on the next call. Stop when LinkedIn returns no `nextCursor`. Categories: `INBOX`, `ARCHIVE`, `OTHER`.
 
 ---
 
