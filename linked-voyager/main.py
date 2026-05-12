@@ -427,10 +427,11 @@ def main():
             print()
 
     elif command == 'sync-messages':
-        # sync-messages [--full] [--limit N] [--since YYYY-MM-DD] [--existing-only]
+        # sync-messages [--full] [--limit N] [--since YYYY-MM-DD] [--existing-only] [--supabase]
         args = sys.argv[2:]
         full = '--full' in args
         existing_only = '--existing-only' in args
+        use_supabase = '--supabase' in args
         limit = None
         since_date = None
         for i, a in enumerate(args):
@@ -491,8 +492,33 @@ def main():
                     msgs = [m for m in msgs if m['sent_at'] >= since_ts]
                 added = MS.insert_messages(msgs)
                 total_new += added
+
+                # Also push to Supabase if requested
+                if use_supabase and msgs:
+                    import supabase_sync as SS
+                    my_urn = br._voyager_my_urn()
+                    my_slug = my_urn.split(':')[-1]
+                    sb_rows = []
+                    for m in msgs:
+                        is_me = (m.get('sender_slug') == my_slug)
+                        sb_rows.append({
+                            'conversation_urn':   m['conversation_urn'],
+                            'participant_name':   c.get('participant_name', ''),
+                            'participant_url':    c.get('participant_url', ''),
+                            'sender_name':        m.get('sender_name', '') or 'me',
+                            'sender_is_me':       is_me,
+                            'message_text':       m.get('text', ''),
+                            'message_date':       m.get('sent_at_iso') or
+                                                  (__import__('datetime').datetime.utcfromtimestamp(m.get('sent_at',0)/1000).isoformat() if m.get('sent_at') else None),
+                        })
+                    res = SS.upsert_messages(sb_rows)
+                    sb_added = res['inserted']
+                    sb_msg = f' | ☁️  +{sb_added} sb' if sb_added else ''
+                else:
+                    sb_msg = ''
+
                 status = '🟢' if added > 0 else '⚪'
-                print(f'  {status} [{idx}/{len(convs)}] {c["participant_name"]}: {len(msgs)} fetched, +{added} new')
+                print(f'  {status} [{idx}/{len(convs)}] {c["participant_name"]}: {len(msgs)} fetched, +{added} new{sb_msg}')
         print(f'\n✅ Sync complete — {total_new} new messages added')
 
     elif command == 'messages-stats':
